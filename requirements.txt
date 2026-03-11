@@ -1,4 +1,15 @@
 openai>=1.30.0
 pydantic>=2.7.0
+pydantic-settings>=2.2.1
 pandas>=2.2.0
 pyarrow>=15.0.0
+requests>=2.32.0
+html5lib>=1.1
+fastapi>=0.110.0
+uvicorn>=0.29.0
+celery[redis]>=5.4.0
+redis>=5.0.0
+langsmith>=0.1.147
+opentelemetry-sdk>=1.24.0
+opentelemetry-exporter-otlp>=1.24.0
+openinference-instrumentation-openai>=0.1.15

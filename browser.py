@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -37,7 +38,38 @@ class BrowserController:
     use_native: bool = field(
         default_factory=lambda: os.getenv("AGENT_BROWSER_NATIVE", "1") != "0"
     )
+    browserbase_api_key: str | None = field(
+        default_factory=lambda: os.getenv("BROWSERBASE_API_KEY")
+    )
+    browserbase_project_id: str | None = field(
+        default_factory=lambda: os.getenv("BROWSERBASE_PROJECT_ID")
+    )
+    explicit_cdp_url: str | None = field(
+        default_factory=lambda: os.getenv("AGENT_BROWSER_CDP_URL")
+        or os.getenv("BROWSERBASE_CDP_URL")
+    )
     _is_open: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        if self._uses_browserbase() and self.retry_delay_seconds < 5.0:
+            self.retry_delay_seconds = 5.0
+        if self._uses_browserbase() and self.retry_attempts > 2:
+            self.retry_attempts = 2
+
+    def is_available(self) -> bool:
+        """Return whether the configured browser binary appears runnable."""
+        if os.path.sep not in self.binary:
+            return shutil.which(self.binary) is not None
+        return os.path.exists(self.binary) and os.access(self.binary, os.X_OK)
+
+    def availability_detail(self) -> str:
+        """Return a short human-readable browser availability status."""
+        if self.is_available():
+            return f"browser binary available at '{self.binary}'"
+        return (
+            f"browser binary '{self.binary}' was not found. "
+            "Set AGENT_BROWSER_BIN or install agent-browser before enabling browser fallback."
+        )
 
     def open(self, url: str) -> None:
         """Open a target URL in the browser session."""
@@ -95,9 +127,11 @@ class BrowserController:
             raise BrowserControllerError("browser session is not open")
 
     def _run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
-        command = [self.binary, *self.extra_args, *args]
+        command = [self.binary, *self._remote_args(), *self.extra_args, *args]
+        display_command = _redact_command(command)
         last_error: BrowserControllerError | None = None
         for attempt in range(1, self.retry_attempts + 1):
+            backoff_seconds: float | None = None
             try:
                 result = subprocess.run(
                     command,
@@ -114,19 +148,20 @@ class BrowserController:
                 ) from exc
             except subprocess.TimeoutExpired as exc:
                 last_error = BrowserControllerError(
-                    f"Command timed out after {self.timeout_seconds:.1f}s: {' '.join(command)}"
+                    f"Command timed out after {self.timeout_seconds:.1f}s: {display_command}"
                 )
             except OSError as exc:
                 last_error = BrowserControllerError(
-                    f"Failed to execute browser command {' '.join(command)}: {exc}"
+                    f"Failed to execute browser command {display_command}: {exc}"
                 )
             else:
                 if result.returncode == 0:
                     return result
                 stderr = result.stderr.strip() or "<no stderr>"
+                backoff_seconds = _parse_retry_after_seconds(stderr) if self._uses_browserbase() else None
                 last_error = BrowserControllerError(
                     f"Browser command failed with exit code {result.returncode}: "
-                    f"{' '.join(command)} | stderr: {stderr}"
+                    f"{display_command} | stderr: {stderr}"
                 )
 
             if attempt < self.retry_attempts:
@@ -134,12 +169,12 @@ class BrowserController:
                     "Browser command failed, retrying (%d/%d): %s",
                     attempt,
                     self.retry_attempts,
-                    " ".join(command),
+                    display_command,
                 )
-                time.sleep(self.retry_delay_seconds)
+                time.sleep(backoff_seconds or self.retry_delay_seconds)
 
         raise last_error or BrowserControllerError(
-            f"Browser command failed after {self.retry_attempts} attempts: {' '.join(command)}"
+            f"Browser command failed after {self.retry_attempts} attempts: {display_command}"
         )
 
     def _clean_output(self, output: str) -> str:
@@ -148,8 +183,87 @@ class BrowserController:
         lines = [line.rstrip() for line in cleaned.splitlines()]
         return "\n".join(line for line in lines if line.strip()).strip()
 
+    def _remote_args(self) -> list[str]:
+        """Build remote CDP CLI arguments when Browserbase or a custom CDP URL is configured."""
+        if self.explicit_cdp_url:
+            return ["--cdp", self.explicit_cdp_url.strip()]
+
+        api_key = (self.browserbase_api_key or "").strip()
+        project_id = (self.browserbase_project_id or "").strip()
+        if api_key and project_id:
+            return ["-p", "browserbase"]
+
+        return []
+
+    def _resolved_cdp_url(self) -> str | None:
+        """Resolve the remote CDP WebSocket URL, if any."""
+        if self.explicit_cdp_url:
+            return self.explicit_cdp_url.strip()
+        api_key = (self.browserbase_api_key or "").strip()
+        project_id = (self.browserbase_project_id or "").strip()
+        if api_key and project_id:
+            return _build_browserbase_cdp_url(
+                api_key=api_key,
+                project_id=project_id,
+            )
+        return None
+
+    def _uses_browserbase(self) -> bool:
+        return bool((self.browserbase_api_key or "").strip() and (self.browserbase_project_id or "").strip())
+
     def _command_env(self) -> dict[str, str]:
         """Build the process environment for agent-browser invocations."""
         env = os.environ.copy()
         env["AGENT_BROWSER_NATIVE"] = "1" if self.use_native else "0"
+        if self.browserbase_api_key:
+            env["BROWSERBASE_API_KEY"] = self.browserbase_api_key
+        if self.browserbase_project_id:
+            env["BROWSERBASE_PROJECT_ID"] = self.browserbase_project_id
         return env
+
+
+def _build_browserbase_cdp_url(*, api_key: str, project_id: str) -> str:
+    """Construct the Browserbase remote CDP connection URL without exposing raw secrets in logs."""
+    query = urlencode(
+        {
+            "apiKey": api_key,
+            "projectId": project_id,
+        },
+        safe="",
+    )
+    return f"wss://connect.browserbase.com?{query}"
+
+
+def _redact_command(command: Sequence[str]) -> str:
+    """Render a shell-safe command string without leaking WebSocket credentials."""
+    return " ".join(
+        shlex.quote(_redact_url(token)) if token.startswith(("ws://", "wss://")) else shlex.quote(token)
+        for token in command
+    )
+
+
+def _redact_url(url: str) -> str:
+    """Mask sensitive query parameters before logging a remote CDP URL."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+
+    redacted_items: list[str] = []
+    for item in parts.query.split("&"):
+        key, sep, value = item.partition("=")
+        if key in {"apiKey", "projectId"} and value:
+            redacted_items.append(f"{key}=***")
+            continue
+        redacted_items.append(item if not sep else f"{key}={value}")
+
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, "&".join(redacted_items), parts.fragment)
+    )
+
+
+def _parse_retry_after_seconds(stderr: str) -> float | None:
+    """Extract a provider-provided retry hint from Browserbase rate-limit errors."""
+    match = re.search(r"try again in (\d+) seconds", stderr, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return float(match.group(1))

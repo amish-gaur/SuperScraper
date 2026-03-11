@@ -9,6 +9,9 @@ from typing import Any, Sequence
 
 import pandas as pd
 
+from dataset_profiler import DatasetProfiler
+from llm import LLMGateway
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +62,27 @@ class MLFormatter:
         self.dataframe.to_parquet(parquet_path, index=False)
         LOGGER.info("Exported dataframe to %s and %s", csv_path, parquet_path)
         return csv_path, parquet_path
+
+    def export_profile(
+        self,
+        *,
+        goal: str,
+        provenance_map: dict[str, str] | None = None,
+        llm_gateway: LLMGateway | None = None,
+        output_dir: str | Path = ".",
+    ) -> Path:
+        """Profile the dataframe and write a JSON report next to the dataset export."""
+        profiler = DatasetProfiler()
+        profile = profiler.profile(
+            self.dataframe,
+            self.dataset_name,
+            goal=goal,
+            provenance_map=provenance_map,
+            llm_gateway=llm_gateway,
+        )
+        path = profiler.write(profile, output_dir=output_dir)
+        LOGGER.info("Exported dataset profile to %s", path)
+        return path
 
 
 def _slugify(value: str) -> str:

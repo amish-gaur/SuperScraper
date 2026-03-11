@@ -1,11 +1,12 @@
+.git
 __pycache__/
 *.py[cod]
 .DS_Store
 .env
 .env.*
-.env.local
+artifacts/
 *.csv
 *.parquet
-artifacts/
-*_profile.json
 pipeline_cache.json
+*.lock
+*.tmp
