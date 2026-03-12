@@ -64,6 +64,16 @@ def infer_goal_cardinality(goal: str) -> GoalCardinality | None:
         return numeric_cardinality
 
     if infer_domain_intent(goal) == "nba" and infer_entity_intent(goal) == "team":
+        if {
+            "historical",
+            "history",
+            "season",
+            "seasons",
+            "yearly",
+            "multi",
+            "multiseason",
+        } & tokens:
+            return None
         return GoalCardinality(count=30, exact=True, reason="all_nba_teams")
 
     if {"u", "s", "us"} & tokens and infer_entity_intent(goal) == "state":

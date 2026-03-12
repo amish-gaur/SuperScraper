@@ -47,6 +47,7 @@ class DomainHealth:
     """Aggregated runtime health for a root domain."""
 
     attempts: int = 0
+    fetch_successes: int = 0
     successes: int = 0
     anti_bot_failures: int = 0
     hard_failures: int = 0
@@ -81,7 +82,7 @@ class SourceHealthRegistry:
         stats.attempts += 1
         stats.last_reason = outcome.reason.value
         if outcome.ok:
-            stats.successes += 1
+            stats.fetch_successes += 1
             if not outcome.text.strip():
                 stats.empty_results += 1
             return

@@ -67,6 +67,13 @@ def build_adapters() -> list[SourceAdapter]:
             matcher=lambda goal: "population" in goal.lower(),
             supplier=_population_urls,
         ),
+        SourceAdapter(
+            name="laptops",
+            matcher=lambda goal: any(token in goal.lower() for token in ("laptop", "laptops", "notebook", "notebooks")) and any(
+                token in goal.lower() for token in ("spec", "specs", "price", "prices", "pc")
+            ),
+            supplier=_laptop_urls,
+        ),
     ]
 
 
@@ -153,6 +160,14 @@ def _population_urls(goal: str) -> list[str]:
         "https://en.wikipedia.org/wiki/List_of_U.S._states_and_territories_by_population",
         "https://en.wikipedia.org/wiki/List_of_U.S._states_and_territories_by_GDP",
         "https://www.census.gov/data/tables/time-series/demo/popest/2020s-state-total.html",
+    ]
+
+
+def _laptop_urls(goal: str) -> list[str]:
+    return [
+        "https://www.notebookcheck.net/Ranking-Best-all-around-laptops-reviewed-by-Notebookcheck.98608.0.html",
+        "https://www.notebookcheck.net/Ranking-Best-affordable-all-around-laptops.281362.0.html",
+        "https://www.notebookcheck.net/The-Best-Ultrabooks.91067.0.html",
     ]
 
 

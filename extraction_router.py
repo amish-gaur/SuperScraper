@@ -270,6 +270,19 @@ class ExtractionRouter:
                 fetch_outcome=outcome,
             )
 
+        document_records = self._synthesize_document_text(
+            source_target,
+            outcome.text,
+            strategy="document_text",
+        )
+        if document_records:
+            return RouteDecision(
+                source_target=source_target,
+                strategy="document_text",
+                records=document_records,
+                fetch_outcome=outcome,
+            )
+
         return RouteDecision(
             source_target=source_target,
             strategy="browser",
@@ -326,6 +339,25 @@ class ExtractionRouter:
             )
         except Exception as exc:
             LOGGER.warning("State payload synthesis failed for %s via %s: %s", source_target.url, strategy, exc)
+            return []
+
+    def _synthesize_document_text(
+        self,
+        source_target: SourceTarget,
+        document_text: str,
+        *,
+        strategy: str,
+    ) -> list[BaseModel]:
+        synthesizer = DataSynthesizer(row_model=self.row_model, llm_gateway=self.llm_gateway)
+        try:
+            return synthesizer.synthesize_document_text(
+                goal=self.goal,
+                source_url=source_target.url,
+                document_text=document_text,
+                strategy=strategy,
+            )
+        except Exception as exc:
+            LOGGER.warning("Document text synthesis failed for %s via %s: %s", source_target.url, strategy, exc)
             return []
 
     def _should_browser_fallback(self, source_target: SourceTarget) -> bool:

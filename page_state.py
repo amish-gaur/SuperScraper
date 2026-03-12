@@ -12,6 +12,14 @@ LINK_LINE_RE = re.compile(r'link\s+"([^"]+)"\s+\[ref=(e\d+)\]', flags=re.IGNOREC
 HEADING_LINE_RE = re.compile(r'heading\s+"([^"]+)"', flags=re.IGNORECASE)
 URL_RE = re.compile(r"https?://\S+", flags=re.IGNORECASE)
 TABLE_SIGNAL_RE = re.compile(r"\b(row|cell|columnheader|table|listitem)\b", flags=re.IGNORECASE)
+SUMMARY_BLOCKED_PHRASES = (
+    "navigation item",
+    "main menu",
+    "jump to content",
+    "create account",
+    "log in",
+    "search",
+)
 
 
 @dataclass(slots=True)
@@ -122,7 +130,7 @@ class PageStateParser:
                 if cleaned:
                     table_like_lines.append(cleaned)
 
-        visible_summary = "\n".join(_clean_line_text(line) for line in lines[:20] if _clean_line_text(line))
+        visible_summary = "\n".join(self._select_summary_lines(lines))
         blocked_signals = [phrase for phrase in self.BLOCKED_PHRASES if phrase in snapshot.lower()]
         title = headings[0] if headings else (clickable_elements[0].label if clickable_elements else None)
         return PageState(
@@ -136,6 +144,67 @@ class PageStateParser:
             blocked_signals=blocked_signals,
             raw_line_count=len(lines),
         )
+
+    def _select_summary_lines(
+        self,
+        lines: list[str],
+        *,
+        max_lines: int = 30,
+        max_chars: int = 2500,
+        min_score: int = 3,
+    ) -> list[str]:
+        """Prefer high-signal content across the full snapshot over the first viewport lines."""
+        scored: list[tuple[int, int, str]] = []
+        for index, line in enumerate(lines):
+            cleaned = _clean_line_text(line)
+            if not cleaned:
+                continue
+
+            lowered = cleaned.lower()
+            if any(phrase in lowered for phrase in self.BLOCKED_PHRASES):
+                continue
+            if any(phrase in lowered for phrase in SUMMARY_BLOCKED_PHRASES):
+                continue
+            if line.lower().startswith(("button ", "textbox ", "searchbox ", "menuitem ")):
+                continue
+
+            score = 0
+            if HEADING_LINE_RE.search(line):
+                score += 5
+            if TABLE_SIGNAL_RE.search(line):
+                score += 4
+            if LINK_LINE_RE.search(line):
+                score += 3
+            if LINE_REF_RE.search(line):
+                score += 1
+            if any(token.isdigit() for token in cleaned):
+                score += 1
+            if 6 <= len(cleaned.split()) <= 18:
+                score += 1
+
+            if score < min_score:
+                continue
+            scored.append((score, index, cleaned))
+
+        if not scored:
+            return []
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        selected: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        total_chars = 0
+        for _, index, cleaned in scored:
+            if cleaned in seen:
+                continue
+            next_chars = total_chars + len(cleaned) + (1 if selected else 0)
+            if len(selected) >= max_lines or next_chars > max_chars:
+                continue
+            selected.append((index, cleaned))
+            seen.add(cleaned)
+            total_chars = next_chars
+
+        selected.sort(key=lambda item: item[0])
+        return [cleaned for _, cleaned in selected]
 
 
 def _clean_line_text(line: str) -> str:

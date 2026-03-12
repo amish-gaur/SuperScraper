@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 from pydantic import BaseModel, ValidationError
 
 from llm import LLMError, LLMGateway, build_record_list_model
+from text_cleaner import TextCleaningUtility
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,7 +39,9 @@ class DataSynthesizer:
             validated_records: list[BaseModel] = []
             for payload in filtered_payloads:
                 try:
-                    validated_records.append(self.row_model.model_validate(payload))
+                    validated_records.append(
+                        self.row_model.model_validate(self._clean_payload_for_schema(payload))
+                    )
                 except ValidationError:
                     continue
             return [record.model_dump(mode="json") for record in validated_records]
@@ -91,6 +96,49 @@ class DataSynthesizer:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             schema_name="state_payload_record_batch",
+            max_tokens=2200,
+        )
+        return response.records
+
+    def synthesize_document_text(
+        self,
+        *,
+        goal: str,
+        source_url: str,
+        document_text: str,
+        strategy: str,
+    ) -> list[BaseModel]:
+        """Extract schema-aligned rows from visible page text when structure-specific paths fail."""
+        prepared_text = self._prepare_document_text_for_prompt(document_text)
+        if not prepared_text:
+            return []
+        if not self._llm_available():
+            LOGGER.info("No LLM gateway available; skipping %s synthesis for %s", strategy, source_url)
+            return []
+
+        response_model = build_record_list_model(self.row_model, "DocumentTextRecordBatch")
+        system_prompt = (
+            "You are a data extraction engine operating on webpage text captured from a browser or raw HTML. "
+            "Infer repeated row-like entities from semi-structured text such as tables, cards, directories, rankings, or lists. "
+            "Use only values explicitly grounded in the provided text. "
+            "Prefer dense repeated patterns over page chrome, ads, or navigation text. "
+            "If a field is unavailable, leave it null instead of inventing values. "
+            "If source_url or reference_url exists in the schema, populate it with the provided source URL when no better URL is visible."
+        )
+        user_prompt = (
+            f"Dataset goal:\n{goal}\n\n"
+            f"Source URL:\n{source_url}\n\n"
+            f"Routing strategy:\n{strategy}\n\n"
+            f"Target row schema:\n{json.dumps(self.row_model.model_json_schema(), indent=2, sort_keys=True)}\n\n"
+            f"Document text:\n{prepared_text}\n\n"
+            "Return the extracted record list."
+        )
+        gateway = self._get_llm_gateway()
+        response = gateway.complete_structured(
+            response_model=response_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema_name="document_text_record_batch",
             max_tokens=2200,
         )
         return response.records
@@ -224,7 +272,35 @@ class DataSynthesizer:
             return False
         if len(records) > self.llm_merge_record_limit:
             return False
+        if self._records_are_structurally_clean(records):
+            return False
         return True
+
+    def _records_are_structurally_clean(self, records: Sequence[BaseModel]) -> bool:
+        if not records:
+            return True
+        populated_counts: list[int] = []
+        identity_keys: set[str] = set()
+        duplicate_identities = 0
+        field_count = max(len(self.row_model.model_fields), 1)
+
+        for record in records:
+            payload = record.model_dump(mode="json")
+            populated_counts.append(
+                sum(0 if self._is_missing_value(value) else 1 for value in payload.values())
+            )
+            identity_key = self._identity_key(record)
+            if identity_key is None:
+                continue
+            if identity_key in identity_keys:
+                duplicate_identities += 1
+            else:
+                identity_keys.add(identity_key)
+
+        avg_populated = sum(populated_counts) / len(populated_counts)
+        completeness_ratio = avg_populated / field_count
+        duplicate_ratio = duplicate_identities / max(len(records), 1)
+        return completeness_ratio >= 0.6 and duplicate_ratio <= 0.1
 
     def _merge_records_deterministically(self, records: Sequence[BaseModel]) -> list[dict[str, Any]]:
         merged_records: list[dict[str, Any]] = []
@@ -237,16 +313,16 @@ class DataSynthesizer:
             seen.add(fingerprint)
             merge_key = self._identity_key(record)
             if merge_key is None:
-                merged_records.append(record.model_dump(mode="json"))
+                merged_records.append(self._clean_payload_for_schema(record.model_dump(mode="json")))
                 continue
             existing_index = merged_by_key.get(merge_key)
             if existing_index is None:
                 merged_by_key[merge_key] = len(merged_records)
-                merged_records.append(record.model_dump(mode="json"))
+                merged_records.append(self._clean_payload_for_schema(record.model_dump(mode="json")))
                 continue
             merged_records[existing_index] = self._merge_record_pair(
                 merged_records[existing_index],
-                record.model_dump(mode="json"),
+                self._clean_payload_for_schema(record.model_dump(mode="json")),
             )
         return merged_records
 
@@ -325,6 +401,65 @@ class DataSynthesizer:
             return existing
         return existing
 
+    def _clean_payload_for_schema(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cleaned = dict(payload)
+        text_values = [
+            str(value).strip()
+            for value in cleaned.values()
+            if isinstance(value, str) and str(value).strip()
+        ]
+        derived_specs = TextCleaningUtility.extract_laptop_specs(", ".join(text_values))
+        for field_name, value in derived_specs.items():
+            if field_name in self.row_model.model_fields and self._is_missing_value(cleaned.get(field_name)):
+                cleaned[field_name] = value
+
+        for field_name in self.row_model.model_fields:
+            value = cleaned.get(field_name)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                normalized = value.strip()
+                cleaned[field_name] = normalized or None
+                value = cleaned[field_name]
+            if value is None or not self._field_expects_numeric(field_name):
+                continue
+            coerced = self._coerce_numeric_field(field_name, value)
+            cleaned[field_name] = coerced
+        return cleaned
+
+    def _field_expects_numeric(self, field_name: str) -> bool:
+        property_schema = self.row_model.model_json_schema().get("properties", {}).get(field_name, {})
+        if property_schema.get("type") in {"integer", "number"}:
+            return True
+        return any(branch.get("type") in {"integer", "number"} for branch in property_schema.get("anyOf", []))
+
+    def _field_expects_integer(self, field_name: str) -> bool:
+        property_schema = self.row_model.model_json_schema().get("properties", {}).get(field_name, {})
+        if property_schema.get("type") == "integer":
+            return True
+        return any(branch.get("type") == "integer" for branch in property_schema.get("anyOf", []))
+
+    def _coerce_numeric_field(self, field_name: str, value: Any) -> Any:
+        if isinstance(value, (int, float)):
+            if self._field_expects_integer(field_name) and float(value).is_integer():
+                return int(value)
+            return value
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        numeric_value = TextCleaningUtility.clean_price(text)
+        if numeric_value is None:
+            spec_value = TextCleaningUtility.extract_laptop_specs(text).get(field_name)
+            if isinstance(spec_value, (int, float)):
+                numeric_value = float(spec_value)
+        if numeric_value is None:
+            return value
+        if self._field_expects_integer(field_name):
+            return int(round(numeric_value))
+        return float(numeric_value)
+
     def _is_missing_value(self, value: Any) -> bool:
         if value is None:
             return True
@@ -343,3 +478,45 @@ class DataSynthesizer:
         if len(serialized) <= max_chars:
             return serialized
         return serialized[:max_chars] + "\n... [truncated]"
+
+    def _prepare_document_text_for_prompt(self, document_text: str, *, max_chars: int = 24000) -> str:
+        """Collapse raw HTML or snapshot text into a denser text block for LLM extraction."""
+        if not document_text.strip():
+            return ""
+
+        cleaned = re.sub(r"<script\b[^>]*>.*?</script>", " ", document_text, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<style\b[^>]*>.*?</style>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
+        cleaned = html.unescape(cleaned)
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in cleaned.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if len(line) < 3:
+                continue
+            lowered = line.lower()
+            if lowered in seen:
+                continue
+            if any(
+                phrase in lowered
+                for phrase in (
+                    "cookie policy",
+                    "privacy policy",
+                    "accept cookies",
+                    "sign in",
+                    "log in",
+                    "jump to content",
+                    "main menu",
+                )
+            ):
+                continue
+            seen.add(lowered)
+            lines.append(line)
+
+        prepared = "\n".join(lines)
+        if len(prepared) <= max_chars:
+            return prepared
+        head = prepared[: max_chars // 2]
+        tail = prepared[-max_chars // 2 :]
+        return f"{head}\n...[truncated]...\n{tail}"

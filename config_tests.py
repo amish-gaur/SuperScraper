@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 import tempfile
 
 from env_utils import configured_api_key_present, env_value_is_usable, read_env_file
+from job_store import JobStore
 from main import load_local_env
+from settings import AppSettings, get_settings
 
 
 def test_read_env_file_supports_case_preserving_and_lowercase_modes() -> None:
@@ -51,6 +54,48 @@ def test_configured_api_key_present_uses_shared_validation_rules() -> None:
     assert not env_value_is_usable("bad key", key="OPENAI_API_KEY")
 
 
+def test_api_get_job_persists_failed_celery_state() -> None:
+    original_openai_key = os.environ.get("OPENAI_API_KEY")
+    original_browser_bin = os.environ.get("AGENT_BROWSER_BIN")
+    try:
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        os.environ["AGENT_BROWSER_BIN"] = "sh"
+        get_settings.cache_clear()
+        api = importlib.import_module("api")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = AppSettings(
+                artifact_root=Path(temp_dir),
+                openai_api_key="sk-test",
+                agent_browser_bin="sh",
+            )
+            store = JobStore(settings)
+            job = store.create_job(goal="x", max_agents=1)
+            store.mark_started(job["job_id"])
+
+            api.store = store
+            api.settings = settings
+            api._celery_broker_is_reachable = lambda redis_url: True
+
+            class FailedResult:
+                result = RuntimeError("boom")
+
+                def failed(self) -> bool:
+                    return True
+
+            api.AsyncResult = lambda job_id, app=None: FailedResult()
+            payload = api.get_job(job["job_id"])
+            persisted = store.read(job["job_id"])
+
+            assert payload.status == "failed"
+            assert persisted["status"] == "failed"
+            assert persisted["error"] == "boom"
+    finally:
+        get_settings.cache_clear()
+        _restore_env_var("OPENAI_API_KEY", original_openai_key)
+        _restore_env_var("AGENT_BROWSER_BIN", original_browser_bin)
+
+
 def _restore_env_var(key: str, value: str | None) -> None:
     if value is None:
         os.environ.pop(key, None)
@@ -63,6 +108,7 @@ def main(*, verbose: bool = True) -> int:
         test_read_env_file_supports_case_preserving_and_lowercase_modes,
         test_load_local_env_replaces_placeholder_keys_only,
         test_configured_api_key_present_uses_shared_validation_rules,
+        test_api_get_job_persists_failed_celery_state,
     ]
     for test in tests:
         test()

@@ -277,6 +277,43 @@ class HtmlTableExtractor:
                 {"team"},
                 {"organization"},
                 {"company"},
+                {"model"},
+                {"device"},
+                {"laptop"},
+            ),
+            "price_usd": (
+                {"price"},
+                {"lowest", "price"},
+                {"msrp"},
+                {"cost"},
+            ),
+            "cpu_model": (
+                {"cpu"},
+                {"processor"},
+                {"chip"},
+            ),
+            "gpu_model": (
+                {"gpu"},
+                {"graphics"},
+                {"graphics", "adapter"},
+            ),
+            "ram_gb": (
+                {"ram"},
+                {"memory"},
+                {"system", "memory"},
+            ),
+            "storage_gb": (
+                {"ssd"},
+                {"storage"},
+                {"drive"},
+            ),
+            "display_size_inches": (
+                {"display"},
+                {"screen"},
+                {"size"},
+            ),
+            "weight_kg": (
+                {"weight"},
             ),
         }
         text = f"{column_name} {column_normalized}"
@@ -321,6 +358,9 @@ class HtmlTableExtractor:
                 score = max(score, 8)
             if "territory" in tokens or "district" in tokens:
                 score = max(score, 6)
+        elif field_name == "name":
+            if any(token in tokens for token in {"model", "laptop", "device"}):
+                score = max(score, 6)
         return score
 
     def _row_to_payload(
@@ -361,6 +401,25 @@ class HtmlTableExtractor:
                 if value:
                     payload["name"] = value
                     break
+        self._fill_laptop_fields(payload)
+
+    def _fill_laptop_fields(self, payload: dict[str, Any]) -> None:
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return
+
+        parsed = _parse_laptop_name_fields(name)
+        if not parsed:
+            return
+
+        for field_name, value in parsed.items():
+            if field_name not in self.row_model.model_fields:
+                continue
+            if field_name == "name":
+                payload[field_name] = value
+                continue
+            if payload.get(field_name) in {None, ""}:
+                payload[field_name] = value
 
     def _has_primary_identity(self, payload: dict[str, Any]) -> bool:
         for candidate in ("name", "team_name", "school", "entity_name", "organization_name", "state"):
@@ -459,8 +518,28 @@ def _parse_numeric_value(text: str) -> float | int | None:
     normalized = normalized.replace("€", "")
     normalized = normalized.replace("£", "")
     normalized = normalized.replace("US$", "")
-    multiplier = 1.0
+    unit_suffixes = (
+        " gb",
+        "gb",
+        " tb",
+        "tb",
+        " kg",
+        "kg",
+        " lbs",
+        "lb",
+        " inch",
+        " inches",
+        " in",
+        " hz",
+        " wh",
+    )
     lowered = normalized.casefold()
+    for suffix in unit_suffixes:
+        if lowered.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            lowered = normalized.casefold()
+            break
+    multiplier = 1.0
     if lowered.endswith("%"):
         normalized = normalized[:-1]
     suffix_multipliers = {
@@ -481,6 +560,52 @@ def _parse_numeric_value(text: str) -> float | int | None:
     if value.is_integer():
         return int(value)
     return value
+
+
+def _parse_laptop_name_fields(name: str) -> dict[str, Any]:
+    text = re.sub(r"\s+", " ", name).strip()
+    if not text:
+        return {}
+
+    parts = [part.strip(" ,|") for part in re.split(r"\s+[⎘|]\s+|\s{2,}", text) if part.strip(" ,|")]
+    fields: dict[str, Any] = {}
+
+    cpu_pattern = re.compile(
+        r"(Intel\s+Core(?:\s+Ultra)?\s+[A-Za-z0-9\- ]+|AMD\s+Ryzen\s+[A-Za-z0-9\- ]+|Apple\s+M\d(?:\s+(?:Pro|Max|Ultra))?|Snapdragon\s+[A-Za-z0-9\- ]+)",
+        flags=re.IGNORECASE,
+    )
+    gpu_pattern = re.compile(
+        r"(NVIDIA\s+GeForce\s+[A-Za-z0-9\- ]+|AMD\s+Radeon\s+[A-Za-z0-9\- ]+|Intel\s+(?:Arc|Iris\s+Xe|UHD)\s+[A-Za-z0-9\- ]*i?GPU?[A-Za-z0-9\- ]*)",
+        flags=re.IGNORECASE,
+    )
+    ram_pattern = re.compile(r"(\d+(?:\.\d+)?)\s*GB\s+(?:RAM|Memory)\b", flags=re.IGNORECASE)
+    display_pattern = re.compile(r"\b(\d{2}(?:\.\d)?)\b")
+
+    for part in parts:
+        if "cpu_model" not in fields:
+            cpu_match = cpu_pattern.search(part)
+            if cpu_match:
+                fields["cpu_model"] = cpu_match.group(1).strip(" ,")
+        if "gpu_model" not in fields:
+            gpu_match = gpu_pattern.search(part)
+            if gpu_match:
+                fields["gpu_model"] = gpu_match.group(1).strip(" ,")
+        if "ram_gb" not in fields:
+            ram_match = ram_pattern.search(part)
+            if ram_match:
+                ram_value = float(ram_match.group(1))
+                fields["ram_gb"] = int(ram_value) if ram_value.is_integer() else ram_value
+
+    if "display_size_inches" not in fields:
+        display_match = re.search(r"\b(\d{2}(?:\.\d)?)\b", text)
+        if display_match:
+            display_value = float(display_match.group(1))
+            if 10.0 <= display_value <= 20.0:
+                fields["display_size_inches"] = display_value
+
+    if parts:
+        fields["name"] = parts[0]
+    return fields
 
 
 def _root_domain(url: str) -> str:

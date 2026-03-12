@@ -18,7 +18,7 @@ from checkpoint import CheckpointManager
 from formatter import MLFormatter
 from goal_intent import infer_goal_cardinality
 from llm import LLMGateway
-from predictive_dataset_builder import PredictiveDatasetBuilder
+from predictive_dataset_builder import DataQualityError, PredictiveDatasetBuilder
 from synthesizer import DataSynthesizer
 from swarm import SwarmDispatcher
 
@@ -67,6 +67,12 @@ def run_pipeline(
         goal=goal,
         dataset_name=blueprint.dataset_name,
         starting_urls=blueprint.starting_urls,
+        target_field=blueprint.row_schema.target_field,
+        core_feature_fields=[
+            field.name
+            for field in blueprint.row_schema.fields
+            if field.ml_role == "feature"
+        ],
         domain_blacklist=domain_blacklist,
     )
     if predictive_builder.is_applicable():
@@ -76,7 +82,17 @@ def run_pipeline(
             message="Attempting direct predictive dataset assembly",
             detail={"dataset_name": blueprint.dataset_name},
         )
-        predictive_result = predictive_builder.build()
+        try:
+            predictive_result = predictive_builder.build()
+        except DataQualityError as exc:
+            LOGGER.warning("Predictive dataset assembly rejected by quality gate: %s", exc)
+            _notify(
+                progress_callback,
+                stage="predictive_builder",
+                message="Direct predictive dataset rejected by quality gate; falling back to swarm",
+                detail={"error": str(exc)},
+            )
+            predictive_result = None
         if predictive_result:
             predictive_records = predictive_result.records
             target_field = blueprint.row_schema.target_field
@@ -157,6 +173,12 @@ def run_pipeline(
         detail={"clean_records": len(clean_records)},
     )
     formatter = MLFormatter(clean_records, blueprint.dataset_name)
+    try:
+        predictive_builder._enforce_fill_rate(formatter.dataframe)
+    except DataQualityError as exc:
+        raise RuntimeError(
+            f"Final dataset rejected due to low fill rate; refusing to export artifacts: {exc}"
+        ) from exc
     formatter.handle_missing_values()
     csv_path, parquet_path = formatter.export(output_dir=output_dir_path)
     profile_path = formatter.export_profile(

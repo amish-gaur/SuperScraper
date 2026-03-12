@@ -306,12 +306,20 @@ def _validate_or_recover_structured_response(
     except ValidationError as exc:
         recovered_payload = _recover_structured_payload(content, response_model)
         if recovered_payload is None:
-            LOGGER.error("Structured response validation failed: %s", content)
+            LOGGER.warning(
+                "Structured response validation failed for %s; using caller fallback. payload=%s",
+                response_model.__name__,
+                _summarize_llm_content(content),
+            )
             raise LLMError(f"Structured response validation failed: {exc}") from exc
         try:
             return response_model.model_validate(recovered_payload)
         except ValidationError as recovered_exc:
-            LOGGER.error("Structured response validation failed: %s", content)
+            LOGGER.warning(
+                "Structured response recovery failed for %s; using caller fallback. payload=%s",
+                response_model.__name__,
+                _summarize_llm_content(content),
+            )
             raise LLMError(
                 f"Structured response validation failed: {recovered_exc}"
             ) from recovered_exc
@@ -402,3 +410,10 @@ def _extract_json_candidate(value: str) -> str:
 
 def _strip_control_characters(value: str) -> str:
     return "".join(character for character in value if character in ("\n", "\r", "\t") or ord(character) >= 32)
+
+
+def _summarize_llm_content(value: str, *, limit: int = 180) -> str:
+    cleaned = " ".join(_strip_control_characters(value).split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 3]}..."

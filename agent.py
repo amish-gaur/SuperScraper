@@ -87,6 +87,36 @@ class AgentDecisionBase(StructuredEnvelope):
             return f"@{cleaned}"
         return cleaned
 
+    @field_validator("action_type", mode="before")
+    @classmethod
+    def normalize_action_type(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        lowered = value.strip().lower()
+        high_level_map = {
+            "extract_visible": "none",
+            "scroll_for_more": "scroll_down",
+            "open_candidate": "click",
+            "open_direct_url": "open_url",
+            "type_into_field": "type",
+            "wait_for_load": "wait",
+            "switch_source": "none",
+            "finish_source": "none",
+        }
+        return high_level_map.get(lowered, lowered)
+
+    @field_validator("action_value", mode="before")
+    @classmethod
+    def normalize_action_value(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return cleaned or None
+        return value
+
     @model_validator(mode="after")
     def validate_action(self) -> "AgentDecisionBase":
         """Reject malformed action payloads before they reach the browser CLI."""
@@ -306,32 +336,34 @@ class ResearchAgent:
                     self._blacklist_current_domain(reason="static or low-density browser snapshot")
                     break
 
-                added = self._extract_visible_rows(snapshot)
-                if added > 0:
-                    LOGGER.info("[%s] Heuristically extracted %d rows from current page", self.name, added)
-                    self.stall_counter = 0
-                    if self._new_record_count() >= self.target_record_count:
-                        break
-                    continue
+                if self.llm_gateway is None:
+                    added = self._extract_visible_rows(snapshot)
+                    if added > 0:
+                        LOGGER.info("[%s] Heuristically extracted %d rows from current page", self.name, added)
+                        self.stall_counter = 0
+                        if self._new_record_count() >= self.target_record_count:
+                            break
+                        continue
 
-                deterministic_action = self._deterministic_navigation(page_state)
-                if deterministic_action:
-                    LOGGER.info("[%s] Applying deterministic navigation: %s", self.name, deterministic_action)
-                    self.artifact_logger.log_step(
-                        step=step,
-                        snapshot=snapshot,
-                        page_state=page_state.model_dump(),
-                        decision=deterministic_action.model_dump(mode="json"),
-                        metadata={"decision_source": "deterministic"},
-                    )
-                    if deterministic_action.status == "complete":
-                        break
-                    await self._execute_action(deterministic_action, prior_snapshot=snapshot)
-                    self._track_action_pattern(deterministic_action)
-                    self.stall_counter += 1
-                    continue
+                if self.llm_gateway is None:
+                    deterministic_action = self._deterministic_navigation(page_state)
+                    if deterministic_action:
+                        LOGGER.info("[%s] Applying deterministic navigation: %s", self.name, deterministic_action)
+                        self.artifact_logger.log_step(
+                            step=step,
+                            snapshot=snapshot,
+                            page_state=page_state.model_dump(),
+                            decision=deterministic_action.model_dump(mode="json"),
+                            metadata={"decision_source": "deterministic"},
+                        )
+                        if deterministic_action.status == "complete":
+                            break
+                        await self._execute_action(deterministic_action, prior_snapshot=snapshot)
+                        self._track_action_pattern(deterministic_action)
+                        self.stall_counter += 1
+                        continue
 
-                decision = await self._decide(page_state)
+                decision = await self._decide(page_state, snapshot)
                 self._log_decision(step, decision)
                 self.artifact_logger.log_step(
                     step=step,
@@ -441,7 +473,7 @@ class ResearchAgent:
             self.last_browser_error = str(exc)
             LOGGER.warning("[%s] Browser command failed: %s", self.name, exc)
 
-    async def _decide(self, page_state: PageState) -> BaseModel:
+    async def _decide(self, page_state: PageState, snapshot: str) -> BaseModel:
         """Ask the LLM what to do next."""
         if self.llm_gateway is None:
             return AgentDecisionBase(
@@ -489,6 +521,7 @@ class ResearchAgent:
             f"System warning:\n{self.loop_warning or 'None'}\n\n"
             f"Row schema:\n{row_schema}\n\n"
             f"Structured page state:\n{page_state.compact_summary()}\n\n"
+            f"Raw snapshot excerpt:\n{self._trim_snapshot(snapshot, limit=7000)}\n\n"
             "Rules:\n"
             "- Use status='navigating' when moving around the site.\n"
             "- Use status='extracting' when you can emit records, including from directory/list pages.\n"

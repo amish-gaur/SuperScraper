@@ -121,8 +121,9 @@ def get_job(job_id: str) -> JobStatusResponse:
         try:
             task_result = AsyncResult(job_id, app=celery_app)
             if task_result.failed():
-                payload["status"] = "failed"
-                payload["error"] = str(task_result.result)
+                error_message = str(task_result.result)
+                store.mark_failure(job_id, error=error_message)
+                payload = store.read(job_id)
         except Exception as exc:
             logging.getLogger(__name__).warning(
                 "Unable to query Celery task state for %s: %s",

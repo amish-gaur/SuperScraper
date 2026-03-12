@@ -359,7 +359,7 @@ class DatasetArchitect:
         return f"{base_description}. {rationale}"
 
     def _normalize_source_targets(self, source_targets: list[SourceTarget], *, goal: str) -> list[SourceTarget]:
-        blocked_domains = ("sports-reference.com", "espn.com")
+        blocked_domains = ("espn.com",)
         normalized: list[SourceTarget] = []
         seen_domains: set[str] = set()
         allow_duplicate_domains = self._allow_duplicate_domains(goal)
@@ -383,11 +383,21 @@ class DatasetArchitect:
                 seen_domains.add(root_domain)
             normalized.append(original.model_copy(update={"url": cleaned}))
             if "wikipedia.org" in root_domain or any(
-                token in root_domain for token in ("kaggle.com", "statbunker.com", "fbref.com", "transfermarkt.", "basketball-reference.com")
+                token in root_domain
+                for token in (
+                    "kaggle.com",
+                    "statbunker.com",
+                    "fbref.com",
+                    "transfermarkt.",
+                    "basketball-reference.com",
+                    "sports-reference.com",
+                    "notebookcheck.net",
+                    "nanoreview.net",
+                )
             ):
                 has_safe_fallback = True
 
-        if not has_safe_fallback:
+        if not has_safe_fallback and len(normalized) < 3:
             wikipedia_fallback = f"https://en.wikipedia.org/w/index.php?search={quote_plus(goal + ' list')}"
             normalized.append(SourceTarget(url=wikipedia_fallback, expected_source_type="html_table"))
             seen_domains.add(_root_domain(wikipedia_fallback))
@@ -835,7 +845,14 @@ class DatasetArchitect:
 
     def _allow_duplicate_domains(self, goal: str) -> bool:
         lowered = goal.lower()
-        return "state" in lowered and "population" in lowered
+        return (
+            ("state" in lowered and "population" in lowered)
+            or ("ncaa" in lowered and "basketball" in lowered and "team statistics" in lowered)
+            or (
+                any(token in lowered for token in ("laptop", "laptops", "notebook", "notebooks"))
+                and any(token in lowered for token in ("spec", "specs", "price", "prices", "pc"))
+            )
+        )
 
     def _normalize_target_record_count(self, proposed_count: int, *, goal: str) -> int:
         cardinality = infer_goal_cardinality(goal)
@@ -856,11 +873,88 @@ class DatasetArchitect:
                 and "population" in lowered
                 and any(token in lowered for token in ("growth", "gdp", "economic"))
             )
+            or (
+                "bank" in lowered
+                and any(token in lowered for token in ("u.s.", "united states", "largest", "biggest"))
+            )
+            or (
+                "nba" in lowered
+                and any(token in lowered for token in ("player", "players"))
+                and any(token in lowered for token in ("salary", "paid", "pay"))
+            )
+            or (
+                any(token in lowered for token in ("startup", "startups"))
+                and any(token in lowered for token in ("valuation", "valued", "label"))
+            )
+            or (
+                any(token in lowered for token in ("laptop", "laptops", "notebook", "notebooks"))
+                and any(token in lowered for token in ("spec", "specs", "price", "prices", "pc"))
+            )
         )
 
     def _deterministic_blueprint_from_goal(self, goal: str) -> DatasetBlueprint:
         """Produce a usable blueprint for common list-oriented goals without an LLM."""
         lowered = goal.lower()
+
+        if "ncaa" in lowered and "basketball" in lowered and "team statistics" in lowered:
+            return DatasetBlueprint(
+                dataset_name="NCAA Men S Basketball Team Statistics",
+                dataset_description="Wide dataset of NCAA Division I men's basketball team performance statistics from public aggregate tables.",
+                target_record_count=365,
+                source_targets=[
+                    SourceTarget(
+                        url="https://www.ncaa.com/stats/basketball-men/d1/current/team/145",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://www.sports-reference.com/cbb/seasons/2025-school-stats.html",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://www.sports-reference.com/cbb/seasons/2025-advanced-school-stats.html",
+                        expected_source_type="html_table",
+                    ),
+                ],
+                row_schema=GeneratedRowSchema(
+                    title="NCAABasketballTeamStatisticsRow",
+                    description="One NCAA Division I men's basketball team represented as a wide statistics row.",
+                    target_field="points_team",
+                    fields=[
+                        SchemaPropertySpec(
+                            name="team",
+                            type="string",
+                            description="Team or school name identifying the row.",
+                        ),
+                        SchemaPropertySpec(
+                            name="points_team",
+                            type="number",
+                            description="Total points scored by the team. This is the supervised learning target for a baseline team-offense dataset.",
+                            ml_role="target",
+                        ),
+                        SchemaPropertySpec(
+                            name="overall_w_l_pct",
+                            type="number",
+                            description="Overall winning percentage. This predictive feature captures team strength and execution.",
+                        ),
+                        SchemaPropertySpec(
+                            name="totals_fg_pct",
+                            type="number",
+                            description="Field goal percentage. This predictive feature captures shooting efficiency.",
+                        ),
+                        SchemaPropertySpec(
+                            name="totals_3p_pct",
+                            type="number",
+                            description="Three-point percentage. This predictive feature captures perimeter scoring efficiency.",
+                        ),
+                        SchemaPropertySpec(
+                            name="totals_trb",
+                            type="number",
+                            description="Total rebounds. This predictive feature captures possession control and physical dominance.",
+                        ),
+                    ],
+                    required=["team", "points_team"],
+                ),
+            )
 
         if "ncaa" in lowered and "basketball" in lowered:
             return DatasetBlueprint(
@@ -963,6 +1057,246 @@ class DatasetArchitect:
                         ),
                     ],
                     required=["population_growth_rate", "state"],
+                ),
+            )
+
+        if "nba" in lowered and any(token in lowered for token in ("player", "players")) and any(
+            token in lowered for token in ("salary", "paid", "pay")
+        ):
+            return DatasetBlueprint(
+                dataset_name="NBA Player Salary Prediction",
+                dataset_description="Dataset of NBA players with salary targets and public performance features from list pages.",
+                target_record_count=75,
+                source_targets=[
+                    SourceTarget(
+                        url="https://www.espn.com/nba/stats/player",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://www.espn.com/nba/salaries",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://hoopshype.com/salaries/players/",
+                        expected_source_type="html_table",
+                    ),
+                ],
+                row_schema=GeneratedRowSchema(
+                    title="NBAPlayerSalaryRow",
+                    description="One NBA player represented as a salary prediction row.",
+                    target_field="salary",
+                    fields=[
+                        SchemaPropertySpec(
+                            name="player",
+                            type="string",
+                            description="Player name identifying the row.",
+                        ),
+                        SchemaPropertySpec(
+                            name="salary",
+                            type="number",
+                            description="Player salary. This is the supervised learning target for the dataset.",
+                            ml_role="target",
+                        ),
+                        SchemaPropertySpec(
+                            name="points_per_game",
+                            type="number",
+                            description="Points per game. This predictive feature captures primary scoring output.",
+                        ),
+                        SchemaPropertySpec(
+                            name="assists_per_game",
+                            type="number",
+                            description="Assists per game. This predictive feature captures playmaking value.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="rebounds_per_game",
+                            type="number",
+                            description="Rebounds per game. This predictive feature captures possession impact.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="minutes_per_game",
+                            type="number",
+                            description="Minutes per game. This predictive feature captures role size and trust from the coaching staff.",
+                            nullable=True,
+                        ),
+                    ],
+                    required=["player", "salary"],
+                ),
+            )
+
+        if any(token in lowered for token in ("startup", "startups")) and any(
+            token in lowered for token in ("valuation", "valued", "label")
+        ):
+            return DatasetBlueprint(
+                dataset_name="Startup Valuation Prediction",
+                dataset_description="Dataset of startup companies with valuation targets and public company features.",
+                target_record_count=150,
+                source_targets=[
+                    SourceTarget(
+                        url="https://en.wikipedia.org/wiki/List_of_unicorn_startup_companies",
+                        expected_source_type="html_table",
+                    ),
+                ],
+                row_schema=GeneratedRowSchema(
+                    title="StartupValuationRow",
+                    description="One startup company represented as a valuation prediction row.",
+                    target_field="valuation",
+                    fields=[
+                        SchemaPropertySpec(
+                            name="company",
+                            type="string",
+                            description="Company name identifying the startup.",
+                        ),
+                        SchemaPropertySpec(
+                            name="valuation",
+                            type="number",
+                            description="Most recent company valuation. This is the supervised learning target.",
+                            ml_role="target",
+                        ),
+                        SchemaPropertySpec(
+                            name="funding",
+                            type="number",
+                            description="Total funding raised. This predictive feature captures capital support and investor confidence.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="country",
+                            type="string",
+                            description="Country where the company operates. This predictive feature captures market context.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="industry",
+                            type="string",
+                            description="Industry or sector classification. This predictive feature captures business model differences.",
+                            nullable=True,
+                        ),
+                    ],
+                    required=["company", "valuation"],
+                ),
+            )
+
+        if "bank" in lowered and any(token in lowered for token in ("u.s.", "united states", "largest", "biggest")):
+            return DatasetBlueprint(
+                dataset_name="Largest US Banks Financial Metrics",
+                dataset_description="Dataset of the largest U.S. banks with size and market metrics from public ranking tables.",
+                target_record_count=100,
+                source_targets=[
+                    SourceTarget(
+                        url="https://en.wikipedia.org/wiki/List_of_largest_banks_in_the_United_States",
+                        expected_source_type="html_table",
+                    ),
+                ],
+                row_schema=GeneratedRowSchema(
+                    title="LargestUSBankRow",
+                    description="One large U.S. bank represented as a financial metrics row.",
+                    target_field="market_capitalization_billions_of_us_as_of_12_per_31_per_2023_5",
+                    fields=[
+                        SchemaPropertySpec(
+                            name="bank",
+                            type="string",
+                            description="Bank name identifying the institution.",
+                        ),
+                        SchemaPropertySpec(
+                            name="market_capitalization_billions_of_us_as_of_12_per_31_per_2023_5",
+                            type="number",
+                            description="Market capitalization in billions of U.S. dollars. This is the supervised learning target for bank size ranking.",
+                            ml_role="target",
+                        ),
+                        SchemaPropertySpec(
+                            name="total_assets_billions_of_us_3",
+                            type="number",
+                            description="Total assets in billions of U.S. dollars. This predictive feature captures institution scale.",
+                        ),
+                        SchemaPropertySpec(
+                            name="cet1_capital_ratio_requirement_4",
+                            type="number",
+                            description="CET1 capital ratio requirement. This predictive feature captures regulatory capital strength.",
+                        ),
+                        SchemaPropertySpec(
+                            name="hq",
+                            type="string",
+                            description="Headquarters location. This predictive feature captures market and regulatory context.",
+                        ),
+                        SchemaPropertySpec(
+                            name="ticker",
+                            type="string",
+                            description="Public market ticker for the bank. This predictive feature helps align market data sources when present.",
+                        ),
+                    ],
+                    required=["bank", "market_capitalization_billions_of_us_as_of_12_per_31_per_2023_5"],
+                ),
+            )
+
+        if any(token in lowered for token in ("laptop", "laptops", "notebook", "notebooks")) and any(
+            token in lowered for token in ("spec", "specs", "price", "prices", "pc")
+        ):
+            return DatasetBlueprint(
+                dataset_name="Modern Laptop Specs for Price Prediction",
+                dataset_description="Structured dataset of modern laptop specifications and prices from public ranking tables.",
+                target_record_count=75,
+                source_targets=[
+                    SourceTarget(
+                        url="https://www.notebookcheck.net/Ranking-Best-all-around-laptops-reviewed-by-Notebookcheck.98608.0.html",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://www.notebookcheck.net/Ranking-Best-affordable-all-around-laptops.281362.0.html",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://www.notebookcheck.net/The-Best-Ultrabooks.91067.0.html",
+                        expected_source_type="html_table",
+                    ),
+                ],
+                row_schema=GeneratedRowSchema(
+                    title="LaptopSpecRow",
+                    description="One modern laptop represented as a structured spec row.",
+                    target_field="price_usd",
+                    fields=[
+                        SchemaPropertySpec(
+                            name="name",
+                            type="string",
+                            description="Laptop model name identifying the device.",
+                        ),
+                        SchemaPropertySpec(
+                            name="price_usd",
+                            type="number",
+                            description="Observed retail price in U.S. dollars. This is the supervised learning target for laptop price prediction.",
+                            ml_role="target",
+                        ),
+                        SchemaPropertySpec(
+                            name="cpu_model",
+                            type="string",
+                            description="Visible processor model. This predictive feature captures compute tier and market segment.",
+                        ),
+                        SchemaPropertySpec(
+                            name="gpu_model",
+                            type="string",
+                            description="Visible graphics processor model. This predictive feature captures graphics capability and premium positioning.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="ram_gb",
+                            type="number",
+                            description="Installed system memory in gigabytes. This predictive feature captures multitasking capacity and product tier.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="display_size_inches",
+                            type="number",
+                            description="Display diagonal size in inches. This predictive feature captures chassis class and usage segment.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="weight_kg",
+                            type="number",
+                            description="Device weight in kilograms. This predictive feature captures portability and build class.",
+                            nullable=True,
+                        ),
+                    ],
+                    required=["name", "price_usd"],
                 ),
             )
 

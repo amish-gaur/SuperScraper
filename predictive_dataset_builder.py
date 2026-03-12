@@ -15,7 +15,7 @@ import requests
 import urllib3
 
 from entity_resolver import EntityResolver
-from goal_intent import infer_domain_intent, infer_entity_intent
+from goal_intent import infer_domain_intent, infer_entity_intent, infer_goal_cardinality
 from source_adapters import adapter_urls_for_goal
 from source_health import FailureReason, fetch_url, REGISTRY
 from source_ranker import SourceRanker
@@ -23,11 +23,19 @@ from source_ranker import SourceRanker
 
 LOGGER = logging.getLogger(__name__)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+IDENTITY_COLUMNS = {"name", "entity_name", "raw_entity_name", "source_url"}
+
+
+class DataQualityError(RuntimeError):
+    """Raised when a candidate dataset fails minimum ML-ready quality thresholds."""
 
 PREDICTIVE_KEYWORDS = {
     "predict",
+    "predictor",
     "prediction",
     "predictive",
+    "estimate",
+    "estimation",
     "forecast",
     "forecasting",
     "model",
@@ -58,25 +66,25 @@ ENTITY_COLUMN_CANDIDATES = (
 )
 DROP_COLUMNS = {"rk", "rank", "unnamed_0", "unnamed_1"}
 NCAA_TEAM_STAT_ALLOWLIST = {
-    "145",  # scoring offense
-    "146",  # scoring defense
-    "147",  # scoring margin
-    "148",  # field goal percentage
-    "149",  # field goal percentage defense
-    "150",  # free throw percentage
-    "151",  # rebound margin
-    "152",  # three point percentage
-    "168",  # winning percentage
-    "214",  # blocks per game
-    "215",  # steals per game
-    "216",  # assists per game
-    "217",  # turnovers per game
-    "474",  # assist/turnover ratio
-    "518",  # three point percentage defense
-    "519",  # turnover margin
-    "931",  # turnovers forced per game
-    "932",  # rebounds per game
-    "1288",  # effective FG pct
+    "145",
+    "146",
+    "147",
+    "148",
+    "149",
+    "150",
+    "151",
+    "152",
+    "168",
+    "214",
+    "215",
+    "216",
+    "217",
+    "474",
+    "518",
+    "519",
+    "931",
+    "932",
+    "1288",
 }
 NCAA_TEAM_STAT_NAMES = {
     "145": "scoring_offense",
@@ -121,22 +129,31 @@ class PredictiveDatasetBuilder:
     minimum_rows: int = 20
     minimum_columns: int = 8
     max_candidate_urls: int = 12
+    target_field: str | None = None
+    core_feature_fields: list[str] = field(default_factory=list)
     domain_blacklist: set[str] = field(default_factory=set)
     source_ranker: SourceRanker = field(default_factory=SourceRanker)
     entity_resolver: EntityResolver = field(default_factory=EntityResolver)
 
     def is_applicable(self) -> bool:
         tokens = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
+        lowered_goal = self.goal.lower()
+        ncaa_team_stats_goal = (
+            "ncaa" in lowered_goal
+            and "basketball" in lowered_goal
+            and "team statistics" in lowered_goal
+        )
         if not (tokens & PREDICTIVE_KEYWORDS):
-            return False
+            if not ncaa_team_stats_goal:
+                return False
         non_predictive_phrases = (
             "dataset of",
             "table of",
             "list of",
         )
-        lowered_goal = self.goal.lower()
         if any(phrase in lowered_goal for phrase in non_predictive_phrases) and not (
             {"predict", "prediction", "predictive", "target", "label"} & tokens
+            or ncaa_team_stats_goal
         ):
             return False
         return True
@@ -183,7 +200,12 @@ class PredictiveDatasetBuilder:
             return None
 
         merged = self._finalize_frame(merged)
-        if len(merged) >= self.minimum_rows and len(merged.columns) >= self.minimum_columns:
+        self._enforce_fill_rate(merged)
+        if (
+            len(merged) >= self.minimum_rows
+            and len(merged.columns) >= self.minimum_columns
+            and self._frame_row_count_is_reasonable(merged)
+        ):
             merged_provenance = self._finalize_provenance(merged, merged_provenance)
             return PredictiveBuildResult(dataframe=merged, provenance_map=merged_provenance)
 
@@ -191,8 +213,13 @@ class PredictiveDatasetBuilder:
         if best_frame is None:
             return None
         best_frame = self._finalize_frame(best_frame)
-        if len(best_frame) < self.minimum_rows or len(best_frame.columns) < self.minimum_columns:
+        if (
+            len(best_frame) < self.minimum_rows
+            or len(best_frame.columns) < self.minimum_columns
+            or not self._frame_row_count_is_reasonable(best_frame)
+        ):
             return None
+        self._enforce_fill_rate(best_frame)
         best_provenance = self._finalize_provenance(
             best_frame,
             dict(getattr(best_frame, "attrs", {}).get("provenance_map", {})),
@@ -218,8 +245,9 @@ class PredictiveDatasetBuilder:
 
     def _expand_urls(self) -> list[str]:
         expanded = list(self.starting_urls)
-        expanded.extend(adapter_urls_for_goal(self.goal))
-        expanded.extend(self._goal_supplemental_urls())
+        if not expanded:
+            expanded.extend(adapter_urls_for_goal(self.goal))
+            expanded.extend(self._goal_supplemental_urls())
         for url in list(expanded):
             expanded.extend(self._derived_companion_urls(url))
         return [
@@ -281,6 +309,8 @@ class PredictiveDatasetBuilder:
 
     def _derived_companion_urls(self, url: str) -> list[str]:
         if "ncaa.com/stats/basketball-men/d1/current/team/" in url:
+            if "ncaa" in self.goal.lower() and "basketball" in self.goal.lower() and "team statistics" in self.goal.lower():
+                return []
             return self._discover_ncaa_team_stat_urls(url)
         if "teamrankings.com/nba/stat/" in url:
             return self._nba_team_stat_urls(self._infer_season_year(self.goal.lower()))
@@ -546,19 +576,185 @@ class PredictiveDatasetBuilder:
         if "raw_entity_name" in finalized.columns:
             finalized = finalized.rename(columns={"raw_entity_name": "name"})
         finalized = finalized.drop_duplicates(subset=["entity_name"])
+        finalized = finalized.rename(columns=self._final_column_label_map(finalized.columns))
 
-        preferred = ["name", "entity_name"]
-        ordered = preferred + sorted(column for column in finalized.columns if column not in preferred)
+        ordered = self._order_final_columns(finalized)
         finalized = finalized[[column for column in ordered if column in finalized.columns]]
+        finalized = finalized.loc[:, ~finalized.columns.duplicated()]
 
         null_threshold = max(1, min(int(len(finalized) * 0.10), 25))
         keep_columns = [
             column
             for column in finalized.columns
-            if column in {"name", "entity_name"} or finalized[column].notna().sum() >= null_threshold
+            if (
+                column in {"name", "entity_name"}
+                or (
+                    finalized[column].notna().sum() >= null_threshold
+                    and not self._is_low_signal_column(column, finalized[column])
+                )
+            )
         ]
         finalized = finalized[keep_columns]
+        finalized = self._trim_excess_columns(finalized)
         return finalized.reset_index(drop=True)
+
+    def _final_column_label_map(self, columns: pd.Index) -> dict[str, str]:
+        rename_map: dict[str, str] = {}
+        seen: set[str] = set()
+        for column in columns:
+            cleaned = self._normalize_final_column_label(str(column))
+            candidate = cleaned
+            suffix = 2
+            while candidate in seen:
+                candidate = f"{cleaned}_{suffix}"
+                suffix += 1
+            seen.add(candidate)
+            rename_map[str(column)] = candidate
+        return rename_map
+
+    def _normalize_final_column_label(self, column: str) -> str:
+        if column == "source_url":
+            return "source"
+        parts = [part for part in str(column).split("_") if part]
+        if not parts:
+            return column
+        cleaned_parts: list[str] = []
+        for part in parts:
+            if cleaned_parts and part == cleaned_parts[-1]:
+                continue
+            cleaned_parts.append(part)
+        if len(cleaned_parts) >= 2 and cleaned_parts[-1] == "value":
+            cleaned_parts = cleaned_parts[:-1]
+        return "_".join(cleaned_parts) or column
+
+    def _order_final_columns(self, frame: pd.DataFrame) -> list[str]:
+        preferred = ["name", "entity_name"]
+        columns = [column for column in frame.columns if column not in preferred]
+        goal_tokens = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
+
+        def priority(column: str) -> tuple[int, int, str]:
+            lowered = column.lower()
+            if lowered in {"source", "source_url"}:
+                return (4, 0, lowered)
+            if any(token in lowered for token in ("target", "label", "outcome", "salary", "valuation", "revenue", "income", "gdp", "growth")):
+                return (1, 0, lowered)
+            if any(token in lowered for token in goal_tokens):
+                return (2, 0, lowered)
+            if pd.api.types.is_numeric_dtype(frame[column]):
+                return (2, 1, lowered)
+            return (3, 0, lowered)
+
+        return preferred + sorted(columns, key=priority)
+
+    def _trim_excess_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        max_columns = max(self.minimum_columns, min(36, max(12, len(frame) * 2)))
+        if len(frame.columns) <= max_columns:
+            return frame
+
+        protected = {"name", "entity_name"}
+        ranked_columns = []
+        for column in frame.columns:
+            if column in protected:
+                continue
+            ranked_columns.append((self._final_column_score(frame, column), column))
+
+        keep = list(protected)
+        keep.extend(column for _, column in sorted(ranked_columns, reverse=True))
+        keep = keep[:max_columns]
+        keep_set = set(keep)
+        return frame[[column for column in frame.columns if column in keep_set]]
+
+    def _final_column_score(
+        self,
+        frame: pd.DataFrame,
+        column: str,
+    ) -> tuple[float, float, int, int, str]:
+        series = frame[column]
+        coverage = float(series.notna().mean())
+        unique = int(series.nunique(dropna=True))
+        numeric_bonus = 1 if pd.api.types.is_numeric_dtype(series) else 0
+        target_bonus = 1 if any(
+            token in column.lower()
+            for token in ("target", "label", "outcome", "salary", "valuation", "revenue", "income", "gdp", "growth")
+        ) else 0
+        return (target_bonus, coverage, numeric_bonus, unique, column)
+
+    def _enforce_fill_rate(self, frame: pd.DataFrame) -> None:
+        target_column = self._resolve_quality_column(frame, [self.target_field] if self.target_field else [])
+        feature_columns = self._resolve_quality_columns(frame, self.core_feature_fields)
+        if not feature_columns:
+            feature_columns = self._infer_core_feature_columns(frame)
+
+        if target_column is not None:
+            target_missing_rate = self._missing_rate(frame[target_column])
+            if target_missing_rate > 0.10:
+                raise DataQualityError(
+                    f"Dataset rejected due to low fill rate: target '{target_column}' missing in {target_missing_rate:.1%} of rows"
+                )
+
+        low_fill_features = [
+            column
+            for column in feature_columns
+            if self._missing_rate(frame[column]) > 0.40
+        ]
+        if low_fill_features:
+            raise DataQualityError(
+                "Dataset rejected due to low fill rate: core features below threshold "
+                f"({', '.join(sorted(low_fill_features))})"
+            )
+
+    def _resolve_quality_columns(self, frame: pd.DataFrame, field_names: list[str]) -> list[str]:
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for field_name in field_names:
+            column = self._resolve_quality_column(frame, [field_name])
+            if column is None or column in seen:
+                continue
+            seen.add(column)
+            resolved.append(column)
+        return resolved
+
+    def _resolve_quality_column(self, frame: pd.DataFrame, field_names: list[str]) -> str | None:
+        if not field_names:
+            return None
+        columns = list(map(str, frame.columns))
+        normalized_columns = {column: self._normalize_column_name(column) for column in columns}
+        for field_name in field_names:
+            if not field_name:
+                continue
+            if field_name in frame.columns:
+                return field_name
+            normalized_field = self._normalize_column_name(field_name)
+            for column, normalized_column in normalized_columns.items():
+                if normalized_column == normalized_field:
+                    return column
+            for column, normalized_column in normalized_columns.items():
+                if normalized_column.startswith(normalized_field) or normalized_field in normalized_column:
+                    return column
+        return None
+
+    def _infer_core_feature_columns(self, frame: pd.DataFrame) -> list[str]:
+        target_column = self._resolve_quality_column(frame, [self.target_field] if self.target_field else [])
+        candidate_columns = [
+            column
+            for column in frame.columns
+            if column not in IDENTITY_COLUMNS and column != target_column
+        ]
+        scored = sorted(
+            candidate_columns,
+            key=lambda column: self._final_column_score(frame, str(column)),
+            reverse=True,
+        )
+        return [str(column) for column in scored[: min(4, len(scored))]]
+
+    def _missing_rate(self, series: pd.Series) -> float:
+        if len(series) == 0:
+            return 1.0
+        missing = series.isna()
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            normalized = series.fillna("").astype(str).str.strip().str.casefold()
+            missing = missing | normalized.isin({"", "unknown", "n/a", "na", "none", "null"})
+        return float(missing.mean())
 
     def _drop_low_value_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
         keep = ["entity_name"]
@@ -608,7 +804,7 @@ class PredictiveDatasetBuilder:
     def _numeric_feature_count(self, frame: pd.DataFrame) -> int:
         count = 0
         for column in frame.columns:
-            if column in {"entity_name", "raw_entity_name", "source_url"}:
+            if column in IDENTITY_COLUMNS:
                 continue
             if pd.api.types.is_numeric_dtype(frame[column]):
                 count += 1
@@ -620,12 +816,37 @@ class PredictiveDatasetBuilder:
         return max(
             frames,
             key=lambda frame: (
+                self._row_count_score(len(frame)),
                 self._frame_goal_alignment_score(frame),
                 self._numeric_feature_count(frame),
                 len(frame.columns),
                 len(frame),
             ),
         )
+
+    def _row_count_score(self, row_count: int) -> float:
+        cardinality = infer_goal_cardinality(self.goal)
+        if cardinality is None or cardinality.count <= 0:
+            return 0.0
+        diff = abs(row_count - cardinality.count)
+        if cardinality.exact:
+            return -float(diff)
+        return -(diff / max(cardinality.count, 1))
+
+    def _frame_row_count_is_reasonable(self, frame: pd.DataFrame) -> bool:
+        cardinality = infer_goal_cardinality(self.goal)
+        if cardinality is None or cardinality.count <= 0:
+            return True
+
+        row_count = len(frame)
+        if cardinality.exact:
+            lower_bound = min(self.minimum_rows, max(3, int(cardinality.count * 0.5)))
+            upper_bound = max(cardinality.count + 2, int(cardinality.count * 1.5))
+            return lower_bound <= row_count <= upper_bound
+
+        lower_bound = min(self.minimum_rows, max(3, int(cardinality.count * 0.4)))
+        upper_bound = max(cardinality.count + 5, int(cardinality.count * 2.0))
+        return lower_bound <= row_count <= upper_bound
 
     def _frame_goal_alignment_score(self, frame: pd.DataFrame) -> int:
         goal_tokens = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
@@ -711,7 +932,7 @@ class PredictiveDatasetBuilder:
         right_keys = set(right["entity_name"].dropna().astype(str))
         if left_keys & right_keys:
             return False
-        identity_columns = {"entity_name", "raw_entity_name", "source_url"}
+        identity_columns = IDENTITY_COLUMNS
         left_columns = {column for column in left.columns if column not in identity_columns}
         right_columns = {column for column in right.columns if column not in identity_columns}
         shared = left_columns & right_columns
@@ -751,10 +972,14 @@ class PredictiveDatasetBuilder:
             candidate_order = [
                 "player", "name", "player_name", "entity_name", "team", "company", "organization", "title"
             ] + [candidate for candidate in ENTITY_COLUMN_CANDIDATES if candidate not in {"player", "name", "team", "company", "organization", "title"}]
-        elif entity_intent in {"company", "bank"}:
+        elif entity_intent == "company":
             candidate_order = [
                 "company", "organization", "name", "entity_name", "title"
             ] + [candidate for candidate in ENTITY_COLUMN_CANDIDATES if candidate not in {"company", "organization", "name", "entity_name", "title"}]
+        elif entity_intent == "bank":
+            candidate_order = [
+                "bank", "name", "organization", "company", "entity_name", "title"
+            ] + [candidate for candidate in ENTITY_COLUMN_CANDIDATES if candidate not in {"bank", "name", "organization", "company", "entity_name", "title"}]
         elif entity_intent in {"team", "club"}:
             candidate_order = [
                 "team", "school", "name", "entity_name", "title"
@@ -1012,6 +1237,29 @@ class PredictiveDatasetBuilder:
     def _normalize_entity_name(self, value: str) -> str:
         return self.entity_resolver.canonical_key(value)
 
+    def _is_low_signal_column(self, column: str, series: pd.Series) -> bool:
+        normalized = str(column).strip().lower()
+        if normalized.isdigit() or normalized in {"column", "unnamed", "unnamed_0", "unnamed_1"}:
+            return True
+        if normalized in {"rk", "rank"} or normalized.endswith("_rk") or "_rank" in normalized:
+            return True
+        if re.fullmatch(r"\d+", normalized):
+            return True
+        if normalized.startswith("unnamed"):
+            return True
+        if pd.api.types.is_numeric_dtype(series):
+            values = series.dropna().tolist()
+            if len(values) >= 5:
+                try:
+                    numeric_values = [float(value) for value in values[: min(len(values), 25)]]
+                except (TypeError, ValueError):
+                    numeric_values = []
+                if numeric_values:
+                    expected = list(range(1, len(numeric_values) + 1))
+                    if numeric_values == expected:
+                        return True
+        return False
+
     def _normalize_numeric_like(self, value: Any) -> str:
         text = str(value).strip()
         if not text or text.lower() in {"nan", "none"}:
@@ -1043,6 +1291,8 @@ class PredictiveDatasetBuilder:
         years = [int(match) for match in re.findall(r"\b(19\d{2}|20\d{2}|21\d{2})\b", lowered_goal)]
         if years:
             return years[-1]
+        if "ncaa" in lowered_goal or ("college" in lowered_goal and "basketball" in lowered_goal):
+            return 2025
         return 2026
 
     def _response_indicates_blocking(self, response: requests.Response) -> bool:

@@ -51,6 +51,8 @@ class SourceRanker:
             "sec.gov": 5,
             "data.gov": 5,
             "census.gov": 5,
+            "notebookcheck.net": 5,
+            "nanoreview.net": 4,
             "sports-reference.com": 4,
             "fortune.com": 3,
             "forbes.com": 2,
@@ -72,6 +74,8 @@ class SourceRanker:
             "fortune-500": 5,
             "season": 3,
             "companies": 3,
+            "laptop": 3,
+            "notebook": 3,
         }
         for token, token_score in path_signals.items():
             if token in full:
@@ -85,6 +89,7 @@ class SourceRanker:
             "subscribe": -4,
             "video": -3,
             "podcast": -3,
+            "reviews": -2,
         }
         for token, penalty in bad_signals.items():
             if token in full:
@@ -116,4 +121,4 @@ def _normalize_url(raw_url: str) -> str:
     scheme = parts.scheme.lower()
     if scheme not in {"http", "https"}:
         return ""
-    return urlunsplit((scheme, parts.netloc.lower(), parts.path.lower(), parts.query, parts.fragment))
+    return urlunsplit((scheme, parts.netloc.lower(), parts.path, parts.query, parts.fragment))
