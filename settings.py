@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -53,6 +54,7 @@ class AppSettings(BaseSettings):
     openai_base_url: str | None = None
     openrouter_site_url: str = "https://localhost"
     openrouter_app_name: str = "Autonomous Data Engineer"
+    enable_semantic_feature_pruning: bool = False
 
     agent_browser_bin: str = "agent-browser"
     agent_browser_native: bool = True
@@ -96,16 +98,16 @@ class AppSettings(BaseSettings):
         if not self.redis_url.strip():
             raise ValueError("REDIS_URL must be configured.")
         if not self.has_llm_api_key:
-            raise ValueError(
-                "One of OPENAI_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY must be configured."
+            logging.getLogger(__name__).warning(
+                "No LLM API key configured. Service will still start, but LLM-backed jobs may fail."
             )
         if "/" in self.agent_browser_bin:
             browser_available = Path(self.agent_browser_bin).exists()
         else:
             browser_available = shutil.which(self.agent_browser_bin) is not None
         if not browser_available:
-            raise ValueError(
-                "AGENT_BROWSER_BIN is not installed or not on PATH. Install agent-browser before starting the API or worker."
+            logging.getLogger(__name__).warning(
+                "AGENT_BROWSER_BIN is not installed or not on PATH. Browser fallback may be unavailable."
             )
 
     @property
