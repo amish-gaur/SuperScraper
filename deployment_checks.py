@@ -80,6 +80,8 @@ def _check_required_modules() -> CheckResult:
         "pydantic_settings",
         "pandas",
         "requests",
+        "crawlee",
+        "playwright",
         "pyarrow",
         "html5lib",
         "fastapi",

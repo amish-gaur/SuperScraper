@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
+import tempfile
 
+from crawlee.errors import HttpClientStatusCodeError
 import pandas as pd
 from pydantic import BaseModel
 
 from agent import AgentDecisionBase
-from architect import DatasetArchitect, DatasetBlueprint
+from architect import DatasetArchitect, DatasetBlueprint, SourceTarget
+from crawlee_fetcher import CrawleeFetchResult, _build_failure_outcome, _sanitize_artifact_for_storage
+from data_validation import SemanticDataValidator
 from entity_resolver import EntityResolver
-from goal_intent import infer_entity_intent, infer_goal_cardinality
+from goal_intent import decompose_goal, infer_entity_intent, infer_goal_cardinality
 from list_page_extractor import ListPageExtractor
 from page_state import PageStateParser
 from predictive_dataset_builder import DataQualityError, PredictiveDatasetBuilder
+from source_discovery import SourceDiscoveryEngine
 from source_health import FailureReason, FetchOutcome, SourceHealthRegistry
+from source_memory import SourceMemory
 from source_ranker import SourceRanker
 from synthesizer import DataSynthesizer
 from text_cleaner import TextCleaningUtility
-from synthesizer import DataSynthesizer
 
 
 class TeamRow(BaseModel):
@@ -40,6 +46,20 @@ class NumericLaptopRow(BaseModel):
     name: str | None = None
     price_usd: float | None = None
     ram_gb: int | None = None
+
+
+class CompensationRow(BaseModel):
+    name: str | None = None
+    salary: float | None = None
+    performance_rating: float | None = None
+    source_url: str | None = None
+
+
+class RangeRow(BaseModel):
+    name: str | None = None
+    salary_min: float | None = None
+    salary_max: float | None = None
+    source_url: str | None = None
 
 
 def test_entity_resolver_handles_nullish_values() -> None:
@@ -93,6 +113,8 @@ def test_architect_uses_deterministic_blueprint_for_weird_nba_salary_goal() -> N
     )
     assert blueprint.row_schema.target_field == "salary"
     assert any("hoopshype.com/salaries/players" in target.url for target in blueprint.source_targets)
+    assert any("espn.com/nba/stats/player" in target.url for target in blueprint.source_targets)
+    assert any("espn.com/nba/salaries" in target.url for target in blueprint.source_targets)
 
 
 def test_architect_uses_deterministic_blueprint_for_startup_valuation_goal() -> None:
@@ -102,6 +124,16 @@ def test_architect_uses_deterministic_blueprint_for_startup_valuation_goal() -> 
     )
     assert blueprint.row_schema.target_field == "valuation"
     assert any("wikipedia.org/wiki/List_of_unicorn_startup_companies" in target.url for target in blueprint.source_targets)
+
+
+def test_architect_uses_deterministic_blueprint_for_fortune_500_goal() -> None:
+    architect = DatasetArchitect(llm_gateway=None)
+    blueprint = architect.design(
+        "Build a predictive dataset of Fortune 500 companies"
+    )
+    assert blueprint.dataset_name == "Fortune 500 Company Financials"
+    assert blueprint.row_schema.target_field == "revenue_usd_millions"
+    assert any("wikipedia.org/wiki/List_of_Fortune_500_companies" in target.url for target in blueprint.source_targets)
 
 
 def test_goal_intent_treats_ncaa_programs_as_school_entities() -> None:
@@ -115,6 +147,43 @@ def test_goal_cardinality_skips_exact_nba_team_count_for_historical_goals() -> N
     assert infer_goal_cardinality(
         "Build a predictive dataset of NBA teams with historical team performance features and playoff outcome target"
     ) is None
+
+
+def test_goal_decomposition_extracts_target_features_and_temporal_scope() -> None:
+    decomposition = decompose_goal(
+        "Build a historical dataset of startup companies to predict valuation from funding and revenue"
+    )
+    assert decomposition.domain_intent == "startup"
+    assert decomposition.entity_intent == "company"
+    assert decomposition.target_hint == "valuation"
+    assert "funding" in decomposition.feature_hints
+    assert decomposition.temporal_scope == "historical"
+
+
+def test_source_memory_reuses_similar_goal_sources() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        memory = SourceMemory(Path(directory) / "memory.json")
+        memory.record_success(
+            "Predict NBA player salary from performance stats",
+            ["https://www.espn.com/nba/salaries", "https://www.espn.com/nba/stats/player"],
+        )
+        reused = memory.similar_urls(
+            "Build an NBA player dataset with salary as target and stats as features"
+        )
+    assert "https://www.espn.com/nba/salaries" in reused
+
+
+def test_source_discovery_generates_non_search_seed_candidates() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        memory = SourceMemory(Path(directory) / "memory.json")
+        discovery = SourceDiscoveryEngine(source_memory=memory)
+        candidates = discovery.discover(
+            "Build a dataset of U.S. states with population growth as the target and GDP as a feature"
+        )
+    urls = [candidate.url for candidate in candidates]
+    assert any("census.gov" in url for url in urls)
+    assert any("wikipedia.org" in url for url in urls)
+    assert all("google.com/search" not in url for url in urls)
 
 
 def test_predictive_builder_normalizes_lowercase_numeric_suffixes() -> None:
@@ -133,10 +202,76 @@ def test_predictive_builder_accepts_estimate_wording_for_bank_goal() -> None:
     assert builder.is_applicable() is True
 
 
+def test_semantic_validator_rejects_negative_and_inverted_ranges() -> None:
+    validator = SemanticDataValidator(row_model=RangeRow)
+    frame = pd.DataFrame(
+        [
+            {"name": "Valid", "salary_min": 100.0, "salary_max": 200.0, "source_url": "https://example.com/a"},
+            {"name": "Negative", "salary_min": -5.0, "salary_max": 100.0, "source_url": "https://example.com/b"},
+            {"name": "Inverted", "salary_min": 300.0, "salary_max": 100.0, "source_url": "https://example.com/c"},
+        ]
+    )
+    result = validator.validate(frame, dataset_name="Comp")
+    assert list(result.dataframe["name"]) == ["Valid"]
+    assert result.report.dropped_row_count == 2
+
+
+def test_semantic_validator_rejects_cross_source_conflicts_on_target() -> None:
+    validator = SemanticDataValidator(row_model=CompensationRow)
+    frame = pd.DataFrame(
+        [
+            {"name": "Alice", "salary": 100.0, "performance_rating": 8.0, "source_url": "https://a.example.com/alice"},
+            {"name": "Bob", "salary": 120.0, "performance_rating": 7.5, "source_url": "https://a.example.com/bob"},
+        ]
+    )
+    raw_records = [
+        CompensationRow(name="Alice", salary=100.0, performance_rating=8.0, source_url="https://espn.com/alice"),
+        CompensationRow(name="Alice", salary=200.0, performance_rating=8.1, source_url="https://hoopshype.com/alice"),
+        CompensationRow(name="Bob", salary=120.0, performance_rating=7.5, source_url="https://espn.com/bob"),
+    ]
+    result = validator.validate(frame, dataset_name="Salaries", raw_records=raw_records)
+    assert list(result.dataframe["name"]) == ["Bob"]
+    assert result.report.cross_source_entity_count == 1
+
+
+def test_crawlee_artifact_sanitizer_truncates_large_payloads() -> None:
+    source_target = SourceTarget(url="https://example.com/data", expected_source_type="html_table")
+    fetch_result = CrawleeFetchResult(
+        fetch_outcome=FetchOutcome(url="https://example.com/data", ok=True, status_code=200),
+        html_text="A" * 250000,
+        json_payload={"payload": "B" * 60000},
+        adapter_payload={"payload": "C" * 10},
+    )
+    artifact = _sanitize_artifact_for_storage(source_target=source_target, fetch_result=fetch_result)
+    assert artifact is not None
+    assert artifact["artifact_truncated"] is True
+    assert len(artifact["html_text"]) == 200000
+    assert artifact["json_payload"]["_truncated"] is True
+
+
 def test_source_ranker_normalizes_mixed_case_urls() -> None:
     ranked = SourceRanker().rank("example", [" HTTPS://EXAMPLE.COM/A ", "https://example.com/a"])
     assert len(ranked) == 2
     assert {item.url for item in ranked} == {"https://example.com/A", "https://example.com/a"}
+
+
+def test_source_ranker_prefers_discovery_backed_table_sources_over_homepages() -> None:
+    ranked = SourceRanker().rank(
+        "Predict NBA player salary from performance stats",
+        [
+            "https://www.espn.com/",
+            "https://www.espn.com/nba/salaries",
+        ],
+        context={
+            "source_family_by_url": {
+                "https://www.espn.com/": "publisher_list",
+                "https://www.espn.com/nba/salaries": "adapter",
+            },
+            "preferred_domains": ("espn.com",),
+            "query_terms": ("nba player salary stats table",),
+        },
+    )
+    assert ranked[0].url == "https://www.espn.com/nba/salaries"
 
 
 def test_source_health_tracks_fetch_and_extraction_success_separately() -> None:
@@ -148,6 +283,16 @@ def test_source_health_tracks_fetch_and_extraction_success_separately() -> None:
     assert stats.fetch_successes == 1
     assert stats.successes == 1
     assert registry.domain_penalty(url) == -6
+
+
+def test_crawlee_failure_outcome_preserves_http_status_code() -> None:
+    outcome = _build_failure_outcome(
+        url="https://example.test/missing",
+        exc=HttpClientStatusCodeError("Client error status code returned", 404),
+    )
+    assert outcome.ok is False
+    assert outcome.status_code == 404
+    assert outcome.reason == FailureReason.HTTP_ERROR
 
 
 def test_page_state_parser_surfaces_high_signal_lines_beyond_page_chrome() -> None:
@@ -282,11 +427,19 @@ def main(*, verbose: bool = True) -> int:
         test_architect_infers_score_as_target_field,
         test_architect_uses_deterministic_blueprint_for_weird_nba_salary_goal,
         test_architect_uses_deterministic_blueprint_for_startup_valuation_goal,
+        test_architect_uses_deterministic_blueprint_for_fortune_500_goal,
         test_goal_intent_treats_ncaa_programs_as_school_entities,
         test_goal_cardinality_skips_exact_nba_team_count_for_historical_goals,
+        test_goal_decomposition_extracts_target_features_and_temporal_scope,
+        test_source_memory_reuses_similar_goal_sources,
+        test_source_discovery_generates_non_search_seed_candidates,
         test_predictive_builder_normalizes_lowercase_numeric_suffixes,
         test_predictive_builder_accepts_estimate_wording_for_bank_goal,
+        test_semantic_validator_rejects_negative_and_inverted_ranges,
+        test_semantic_validator_rejects_cross_source_conflicts_on_target,
+        test_crawlee_artifact_sanitizer_truncates_large_payloads,
         test_source_ranker_normalizes_mixed_case_urls,
+        test_source_ranker_prefers_discovery_backed_table_sources_over_homepages,
         test_source_health_tracks_fetch_and_extraction_success_separately,
         test_page_state_parser_surfaces_high_signal_lines_beyond_page_chrome,
         test_synthesizer_prepares_document_text_by_stripping_html_noise,

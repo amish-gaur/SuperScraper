@@ -7,5 +7,9 @@ __pycache__/
 *.csv
 *.parquet
 artifacts/
+storage/
 *_profile.json
 pipeline_cache.json
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import json
 import logging
 import re
 from typing import Any
 from urllib.parse import urlparse
 
+from crawlee import Request
 import requests
 
 from architect import SourceTarget
@@ -17,31 +18,59 @@ from architect import SourceTarget
 LOGGER = logging.getLogger(__name__)
 
 
-class DomainAdapter(ABC):
+class DomainAdapter:
     """Base interface for domain-specific extraction shortcuts."""
 
-    @abstractmethod
     def matches(self, source_target: SourceTarget) -> bool:
         """Return whether this adapter can handle the given source target."""
+        raise NotImplementedError
 
-    @abstractmethod
+    def prefers_crawlee(self) -> bool:
+        """Return whether this adapter should run through Crawlee routing."""
+        return True
+
+    def requires_javascript(self, source_target: SourceTarget) -> bool:
+        """Return whether this adapter needs a Playwright-backed crawl."""
+        return False
+
+    def build_request(self, source_target: SourceTarget) -> Request:
+        """Build the initial Crawlee request enqueued by the extraction router."""
+        return Request.from_url(
+            source_target.url,
+            user_data={
+                "source_target_url": source_target.url,
+                "expected_source_type": source_target.expected_source_type,
+            },
+        )
+
     def fetch_payload(self, source_target: SourceTarget) -> dict[str, Any] | None:
-        """Return a raw JSON-like payload ready for downstream synthesis."""
+        """Compatibility fallback for adapters that do not need Crawlee context."""
+        return None
+
+    async def fetch_payload_with_context(
+        self,
+        source_target: SourceTarget,
+        context: Any,
+    ) -> dict[str, Any] | None:
+        """Return a raw payload using Crawlee request context."""
+        return self.fetch_payload(source_target)
 
 
 @dataclass(slots=True)
 class NBAStatsAdapter(DomainAdapter):
     """Proof-of-concept adapter for nba.com/stats hidden JSON endpoints."""
 
-    timeout_seconds: float = 20.0
     retry_attempts: int = 2
-    session: requests.Session = field(default_factory=requests.Session)
 
     def matches(self, source_target: SourceTarget) -> bool:
         hostname = (urlparse(source_target.url).hostname or "").lower()
         return hostname.endswith("nba.com") and "/stats" in source_target.url.lower()
 
-    def fetch_payload(self, source_target: SourceTarget) -> dict[str, Any] | None:
+    async def fetch_payload_with_context(
+        self,
+        source_target: SourceTarget,
+        context: Any,
+    ) -> dict[str, Any] | None:
         endpoint, params = self._resolve_endpoint(source_target.url)
         headers = {
             "User-Agent": (
@@ -56,19 +85,20 @@ class NBAStatsAdapter(DomainAdapter):
             "x-nba-stats-origin": "stats",
             "x-nba-stats-token": "true",
         }
-        last_error: requests.RequestException | None = None
-        response: requests.Response | None = None
+        last_error: Exception | None = None
+        body_text = ""
         for attempt in range(1, self.retry_attempts + 2):
             try:
-                response = self.session.get(
-                    endpoint,
-                    params=params,
+                response = await context.send_request(
+                    self._api_url(endpoint, params),
                     headers=headers,
-                    timeout=self.timeout_seconds,
                 )
-                response.raise_for_status()
+                body = await response.read()
+                body_text = body.decode("utf-8", errors="replace")
+                if response.status_code >= 400:
+                    raise RuntimeError(f"http status {response.status_code}")
                 break
-            except requests.RequestException as exc:
+            except Exception as exc:
                 last_error = exc
                 LOGGER.warning(
                     "NBAStatsAdapter attempt %d failed for %s: %s",
@@ -76,13 +106,13 @@ class NBAStatsAdapter(DomainAdapter):
                     source_target.url,
                     exc,
                 )
-                response = None
-        if response is None:
+                body_text = ""
+        if not body_text:
             LOGGER.warning("NBAStatsAdapter exhausted retries for %s: %s", source_target.url, last_error)
             return None
 
         try:
-            payload = response.json()
+            payload = json.loads(body_text)
         except ValueError as exc:
             LOGGER.warning("NBAStatsAdapter returned non-JSON for %s: %s", source_target.url, exc)
             return None
@@ -90,7 +120,7 @@ class NBAStatsAdapter(DomainAdapter):
         return {
             "adapter": "nba_stats",
             "source_url": source_target.url,
-            "api_url": response.url,
+            "api_url": self._api_url(endpoint, params),
             "endpoint": endpoint,
             "params": params,
             "payload": payload,
@@ -189,6 +219,11 @@ class NBAStatsAdapter(DomainAdapter):
         if match:
             return match.group(1).replace("+", " ")
         return "Regular Season"
+
+    def _api_url(self, endpoint: str, params: dict[str, str]) -> str:
+        prepared = requests.PreparedRequest()
+        prepared.prepare_url(endpoint, params)
+        return str(prepared.url)
 
 
 def build_domain_adapters() -> list[DomainAdapter]:

@@ -13,9 +13,10 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 
 from architect import SourceTarget
+from crawlee_fetcher import CrawleeFetchResult, CrawleeFetcher, CrawleeStaticRequestProcessor
 from domain_adapters import DomainAdapter, build_domain_adapters
 from html_table_extractor import HtmlTableExtractor
-from source_health import FailureReason, FetchOutcome, fetch_url
+from source_health import FailureReason, FetchOutcome
 from synthesizer import DataSynthesizer
 
 
@@ -221,10 +222,35 @@ class ExtractionRouter:
     domain_blacklist: set[str] | None = None
     adapters: list[DomainAdapter] = field(default_factory=build_domain_adapters)
     state_sniffer: StateSniffer = field(default_factory=StateSniffer)
+    static_processor: CrawleeStaticRequestProcessor | None = None
+    fetcher: CrawleeFetcher = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.fetcher = CrawleeFetcher(
+            timeout_seconds=self.timeout_seconds,
+            static_processor=self.static_processor,
+        )
 
     def route(self, source_target: SourceTarget) -> RouteDecision:
         adapter = self._select_adapter(source_target)
-        if adapter is not None:
+        crawlee_result: CrawleeFetchResult | None = None
+        if adapter is not None and adapter.prefers_crawlee():
+            crawlee_result = self._fetch_with_adapter(source_target, adapter)
+            if crawlee_result.adapter_payload:
+                records = self._synthesize_payload(
+                    source_target,
+                    crawlee_result.adapter_payload,
+                    strategy="domain_adapter",
+                )
+                if records:
+                    return RouteDecision(
+                        source_target=source_target,
+                        strategy="domain_adapter",
+                        records=records,
+                        raw_payload=crawlee_result.adapter_payload,
+                        fetch_outcome=crawlee_result.fetch_outcome,
+                    )
+        elif adapter is not None:
             payload = adapter.fetch_payload(source_target)
             if payload:
                 records = self._synthesize_payload(source_target, payload, strategy="domain_adapter")
@@ -236,7 +262,37 @@ class ExtractionRouter:
                         raw_payload=payload,
                     )
 
-        outcome = self._fetch_html(source_target.url)
+        if crawlee_result is None:
+            crawlee_result = self._fetch_target(source_target)
+        return self.route_prefetched(
+            source_target,
+            crawlee_result,
+            adapter=adapter,
+        )
+
+    def route_prefetched(
+        self,
+        source_target: SourceTarget,
+        crawlee_result: CrawleeFetchResult,
+        *,
+        adapter: DomainAdapter | None = None,
+    ) -> RouteDecision:
+        if adapter is not None and crawlee_result.adapter_payload:
+            records = self._synthesize_payload(
+                source_target,
+                crawlee_result.adapter_payload,
+                strategy="domain_adapter",
+            )
+            if records:
+                return RouteDecision(
+                    source_target=source_target,
+                    strategy="domain_adapter",
+                    records=records,
+                    raw_payload=crawlee_result.adapter_payload,
+                    fetch_outcome=crawlee_result.fetch_outcome,
+                )
+
+        outcome = crawlee_result.fetch_outcome
         if not outcome.ok or not outcome.text:
             return RouteDecision(
                 source_target=source_target,
@@ -244,6 +300,21 @@ class ExtractionRouter:
                 requires_browser=self._should_browser_fallback(source_target),
                 fetch_outcome=outcome,
             )
+
+        if crawlee_result is not None and crawlee_result.json_payload is not None:
+            records = self._synthesize_payload(
+                source_target,
+                {"payload": crawlee_result.json_payload},
+                strategy="json_payload",
+            )
+            if records:
+                return RouteDecision(
+                    source_target=source_target,
+                    strategy="json_payload",
+                    records=records,
+                    fetch_outcome=outcome,
+                    raw_payload={"payload": crawlee_result.json_payload},
+                )
 
         sniffed = self.state_sniffer.sniff(outcome.text)
         if sniffed:
@@ -261,6 +332,10 @@ class ExtractionRouter:
             self.row_model,
             timeout_seconds=self.timeout_seconds,
             domain_blacklist=self.domain_blacklist,
+            html_fetcher=lambda _url: self._fetch_html(
+                _url,
+                expected_source_type=source_target.expected_source_type,
+            ),
         ).extract_from_html(source_target.url, outcome.text)
         if html_records:
             return RouteDecision(
@@ -291,18 +366,19 @@ class ExtractionRouter:
             raw_payload=sniffed,
         )
 
-    def _fetch_html(self, url: str) -> FetchOutcome:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; WebScraperPrototype/1.0; "
-                "+https://example.com/web-scraper)"
-            )
-        }
-        outcome = fetch_url(
+    def _fetch_with_adapter(self, source_target: SourceTarget, adapter: DomainAdapter) -> CrawleeFetchResult:
+        return self.fetcher.fetch_target(
+            source_target,
+            adapter=adapter,
+        )
+
+    def _fetch_target(self, source_target: SourceTarget) -> CrawleeFetchResult:
+        return self.fetcher.fetch_target(source_target)
+
+    def _fetch_html(self, url: str, *, expected_source_type: str = "unknown") -> FetchOutcome:
+        outcome = self.fetcher.fetch_html(
             url,
-            headers=headers,
-            timeout_seconds=self.timeout_seconds,
-            verify=False,
+            expected_source_type=expected_source_type,
         )
         if outcome.reason in {FailureReason.HTTP_403, FailureReason.HTTP_429, FailureReason.ANTI_BOT}:
             self._blacklist_domain(url)
@@ -320,6 +396,10 @@ class ExtractionRouter:
             if adapter.matches(source_target):
                 return adapter
         return None
+
+    def select_adapter(self, source_target: SourceTarget) -> DomainAdapter | None:
+        """Return the first matching domain adapter for a source target."""
+        return self._select_adapter(source_target)
 
     def _synthesize_payload(
         self,
@@ -368,6 +448,16 @@ class ExtractionRouter:
             "json_api",
             "html_table",
         }
+
+    def should_route_with_crawlee(
+        self,
+        source_target: SourceTarget,
+        *,
+        adapter: DomainAdapter | None = None,
+    ) -> bool:
+        if adapter is not None and adapter.prefers_crawlee():
+            return True
+        return source_target.expected_source_type in {"html_table", "json_api"}
 
     def _enrich_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)

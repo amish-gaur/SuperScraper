@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: web-scraper-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: ARTIFACT_ROOT
+        value: /tmp/artifacts
+      - key: REDIS_URL
+        value: redis://redis:6379/0
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        sync: false

@@ -1,4 +1,5 @@
 openai>=1.30.0
+crawlee[playwright]>=1.5.0
 pydantic>=2.7.0
 pydantic-settings>=2.2.1
 pandas>=2.2.0

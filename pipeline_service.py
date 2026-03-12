@@ -15,10 +15,12 @@ from architect import (
     schema_to_json_schema,
 )
 from checkpoint import CheckpointManager
+from data_validation import DataValidationError, SemanticDataValidator
 from formatter import MLFormatter
 from goal_intent import infer_goal_cardinality
 from llm import LLMGateway
 from predictive_dataset_builder import DataQualityError, PredictiveDatasetBuilder
+from source_memory import SourceMemory
 from synthesizer import DataSynthesizer
 from swarm import SwarmDispatcher
 
@@ -33,6 +35,7 @@ class PipelineArtifacts:
     csv_path: str
     parquet_path: str
     profile_path: str
+    validation_path: str
     rows: int
     columns: int
 
@@ -53,6 +56,7 @@ def run_pipeline(
     checkpoint_manager = CheckpointManager(
         checkpoint_path or output_dir_path / "pipeline_cache.json"
     )
+    source_memory = SourceMemory()
 
     _notify(
         progress_callback,
@@ -62,6 +66,11 @@ def run_pipeline(
     )
     architect = DatasetArchitect(llm_gateway=llm_gateway)
     blueprint = architect.design(goal, forbidden_domains=domain_blacklist)
+    row_model = json_schema_to_pydantic_model(
+        schema_to_json_schema(blueprint.row_schema),
+        model_name=blueprint.row_schema.title,
+    )
+    validator = SemanticDataValidator(row_model=row_model)
 
     predictive_builder = PredictiveDatasetBuilder(
         goal=goal,
@@ -74,6 +83,12 @@ def run_pipeline(
             if field.ml_role == "feature"
         ],
         domain_blacklist=domain_blacklist,
+        progress_callback=lambda message, detail: _notify(
+            progress_callback,
+            stage="predictive_builder",
+            message=message,
+            detail=detail,
+        ),
     )
     if predictive_builder.is_applicable():
         _notify(
@@ -101,7 +116,25 @@ def run_pipeline(
                 goal=goal,
                 target_field=target_field,
             ):
-                formatter = MLFormatter(predictive_records, blueprint.dataset_name)
+                _notify(
+                    progress_callback,
+                    stage="validation",
+                    message="Validating dataset semantics",
+                    detail={"candidate_rows": len(predictive_records)},
+                )
+                try:
+                    validation_result = validator.validate(
+                        predictive_result.dataframe,
+                        dataset_name=blueprint.dataset_name,
+                    )
+                except DataValidationError as exc:
+                    raise RuntimeError(
+                        f"Predictive dataset rejected by semantic validation: {exc}"
+                    ) from exc
+                formatter = MLFormatter(
+                    validation_result.dataframe.to_dict(orient="records"),
+                    blueprint.dataset_name,
+                )
                 formatter.handle_missing_values()
                 csv_path, parquet_path = formatter.export(output_dir=output_dir_path)
                 profile_path = formatter.export_profile(
@@ -110,19 +143,18 @@ def run_pipeline(
                     llm_gateway=llm_gateway,
                     output_dir=output_dir_path,
                 )
+                validation_path = validation_result.report.write(output_dir=output_dir_path)
+                source_memory.record_success(goal, blueprint.starting_urls)
                 return PipelineArtifacts(
                     dataset_name=blueprint.dataset_name,
                     csv_path=str(csv_path.resolve()),
                     parquet_path=str(parquet_path.resolve()),
                     profile_path=str(profile_path.resolve()),
-                    rows=len(predictive_records),
-                    columns=len(predictive_records[0]),
+                    validation_path=str(validation_path.resolve()),
+                    rows=len(validation_result.dataframe),
+                    columns=len(validation_result.dataframe.columns),
                 )
 
-    row_model = json_schema_to_pydantic_model(
-        schema_to_json_schema(blueprint.row_schema),
-        model_name=blueprint.row_schema.title,
-    )
     scrape_row_model = relax_pydantic_model(
         row_model,
         model_name=f"{blueprint.row_schema.title}ScrapePartial",
@@ -179,6 +211,21 @@ def run_pipeline(
         raise RuntimeError(
             f"Final dataset rejected due to low fill rate; refusing to export artifacts: {exc}"
         ) from exc
+    _notify(
+        progress_callback,
+        stage="validation",
+        message="Validating dataset semantics",
+        detail={"candidate_rows": len(clean_records)},
+    )
+    try:
+        validation_result = validator.validate(
+            formatter.dataframe,
+            dataset_name=blueprint.dataset_name,
+            raw_records=raw_records,
+        )
+    except DataValidationError as exc:
+        raise RuntimeError(f"Final dataset rejected by semantic validation: {exc}") from exc
+    formatter.dataframe = validation_result.dataframe
     formatter.handle_missing_values()
     csv_path, parquet_path = formatter.export(output_dir=output_dir_path)
     profile_path = formatter.export_profile(
@@ -187,14 +234,17 @@ def run_pipeline(
         llm_gateway=llm_gateway,
         output_dir=output_dir_path,
     )
-    _log_cardinality_gap(goal=goal, actual_rows=len(clean_records))
+    validation_path = validation_result.report.write(output_dir=output_dir_path)
+    source_memory.record_success(goal, blueprint.starting_urls)
+    _log_cardinality_gap(goal=goal, actual_rows=len(validation_result.dataframe))
     return PipelineArtifacts(
         dataset_name=blueprint.dataset_name,
         csv_path=str(csv_path.resolve()),
         parquet_path=str(parquet_path.resolve()),
         profile_path=str(profile_path.resolve()),
-        rows=len(clean_records),
-        columns=len(clean_records[0]),
+        validation_path=str(validation_path.resolve()),
+        rows=len(validation_result.dataframe),
+        columns=len(validation_result.dataframe.columns),
     )
 
 

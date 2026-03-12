@@ -12,8 +12,9 @@ from urllib.parse import quote_plus, urlparse
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from source_adapters import adapter_urls_for_goal
-from goal_intent import infer_goal_cardinality
+from goal_intent import decompose_goal, infer_goal_cardinality
 from llm import LLMError, LLMGateway, StructuredEnvelope
+from source_discovery import SourceDiscoveryEngine
 from source_health import REGISTRY
 from source_ranker import SourceRanker
 
@@ -102,6 +103,7 @@ class DatasetArchitect:
     def __init__(self, llm_gateway: LLMGateway | None = None) -> None:
         self.llm_gateway = llm_gateway
         self.source_ranker = SourceRanker()
+        self.source_discovery = SourceDiscoveryEngine()
 
     def design(self, goal: str, forbidden_domains: set[str] | None = None) -> DatasetBlueprint:
         """Generate a dataset blueprint and row schema for the requested goal."""
@@ -120,10 +122,11 @@ class DatasetArchitect:
         system_prompt = (
             "You are a Senior Machine Learning Engineer designing supervised-learning datasets for web scraping. "
             "You must respond with a valid JSON object matching the requested structure. "
-            "Given a high-level ML goal, first identify the single Target Variable that should be predicted, then identify 3 to 5 high-signal Predictive Features that are likely to help predict that target. "
+            "Given a high-level ML goal, you must first execute an internal step called Feature Brainstorming. "
+            "In Feature Brainstorming, identify the single Target Variable that should be predicted, then generate 3 to 5 logical, high-signal Predictive Features that are likely to causally or statistically help predict that target. "
             "Favor observable columns that are causally or statistically useful for prediction and likely to appear together on a single public list, directory, aggregator, table, or index page. "
             "Strictly exclude low-signal, decorative, or administrative fields such as jersey colors, website URLs, logos, random IDs, UUIDs, slugs, internal keys, and other metadata that would not materially help a supervised model. "
-            "The row schema must contain exactly one target field plus 3 to 5 predictive feature fields. "
+            "The row schema must contain exactly one target field plus the 3 to 5 brainstormed predictive feature fields, and those brainstormed features must all be present in row_schema.fields and row_schema.required. "
             "Use strict primitive types only: numerical or continuous values must be integer or number, binary indicators must be boolean, and categorical/text values must be string. "
             "Every field description must explain why the value is being extracted for modeling, not just what it is. "
             "Do not plan around search engines. Instead, identify likely public source domains and return direct source targets "
@@ -144,9 +147,11 @@ class DatasetArchitect:
             "4. Four to eight source_targets using full https:// URLs from likely source sites.\n"
             "5. A JSON Schema for a single dataset row with simple JSON types only.\n\n"
             "For the row schema:\n"
+            "- First perform Feature Brainstorming internally before writing the schema.\n"
             "- First decide the primary target variable and set row_schema.target_field to that field name.\n"
             "- Include exactly one field with ml_role=\"target\".\n"
-            "- Include 3 to 5 additional fields with ml_role=\"feature\".\n"
+            "- Include 3 to 5 additional brainstormed fields with ml_role=\"feature\".\n"
+            "- Every brainstormed feature must appear in row_schema.required so the extractor schema strictly asks for it.\n"
             "- Each field description must state why that field matters for prediction.\n"
             "- Do not include URLs, IDs, decorative attributes, or provenance-only columns in the row schema.\n\n"
             "The source targets should be direct entry points to data-rich list pages such as roster pages, statistics indexes, public directories, "
@@ -188,7 +193,8 @@ class DatasetArchitect:
             field.name for field in normalized_fields if not field.nullable
         ]
 
-        raw_required = blueprint.row_schema.required or inferred_required
+        raw_required = list(blueprint.row_schema.required or inferred_required)
+        raw_required.extend(declared_fields)
         normalized_required: list[str] = []
         seen: set[str] = set()
         for field_name in raw_required:
@@ -359,13 +365,33 @@ class DatasetArchitect:
         return f"{base_description}. {rationale}"
 
     def _normalize_source_targets(self, source_targets: list[SourceTarget], *, goal: str) -> list[SourceTarget]:
-        blocked_domains = ("espn.com",)
+        blocked_domains: tuple[str, ...] = ()
         normalized: list[SourceTarget] = []
         seen_domains: set[str] = set()
         allow_duplicate_domains = self._allow_duplicate_domains(goal)
+        minimum_targets = 1 if self._should_use_deterministic_blueprint(goal) else 3
         has_safe_fallback = False
-        ranked_candidates = self.source_ranker.rank(goal, [target.url for target in source_targets])
+        discovery_candidates = self.source_discovery.discover(goal, limit=10)
+        discovery_by_url = {candidate.url: candidate for candidate in discovery_candidates}
         target_by_url = {target.url: target for target in source_targets}
+        for candidate in discovery_candidates:
+            target_by_url.setdefault(
+                candidate.url,
+                SourceTarget(
+                    url=candidate.url,
+                    expected_source_type=candidate.expected_source_type,
+                ),
+            )
+        ranking_context = {
+            "source_family_by_url": {candidate.url: candidate.family for candidate in discovery_candidates},
+            "preferred_domains": tuple(
+                _root_domain(candidate.url)
+                for candidate in discovery_candidates
+                if candidate.family in {"memory", "adapter", "official_dataset", "aggregator", "reference_list"}
+            ),
+            "query_terms": self.source_discovery.search_queries(goal),
+        }
+        ranked_candidates = self.source_ranker.rank(goal, list(target_by_url), context=ranking_context)
         for ranked in ranked_candidates:
             original = target_by_url.get(ranked.url, SourceTarget(url=ranked.url, expected_source_type="unknown"))
             url = self._normalize_seed_url(original.url, goal=goal)
@@ -381,7 +407,10 @@ class DatasetArchitect:
                 continue
             if not allow_duplicate_domains:
                 seen_domains.add(root_domain)
-            normalized.append(original.model_copy(update={"url": cleaned}))
+            expected_source_type = original.expected_source_type
+            if expected_source_type == "unknown" and cleaned in discovery_by_url:
+                expected_source_type = discovery_by_url[cleaned].expected_source_type
+            normalized.append(original.model_copy(update={"url": cleaned, "expected_source_type": expected_source_type}))
             if "wikipedia.org" in root_domain or any(
                 token in root_domain
                 for token in (
@@ -397,11 +426,11 @@ class DatasetArchitect:
             ):
                 has_safe_fallback = True
 
-        if not has_safe_fallback and len(normalized) < 3:
+        if not has_safe_fallback and len(normalized) < minimum_targets:
             wikipedia_fallback = f"https://en.wikipedia.org/w/index.php?search={quote_plus(goal + ' list')}"
             normalized.append(SourceTarget(url=wikipedia_fallback, expected_source_type="html_table"))
             seen_domains.add(_root_domain(wikipedia_fallback))
-        if len(normalized) < 3:
+        if len(normalized) < minimum_targets:
             for fallback in self.source_ranker.rank(goal, self._deterministic_fallback_urls(goal)):
                 root_domain = _root_domain(fallback.url)
                 if (root_domain in seen_domains and not allow_duplicate_domains) or REGISTRY.should_cooldown(fallback.url):
@@ -409,12 +438,13 @@ class DatasetArchitect:
                 normalized.append(SourceTarget(url=fallback.url, expected_source_type="unknown"))
                 if not allow_duplicate_domains:
                     seen_domains.add(root_domain)
-                if len(normalized) >= 3:
+                if len(normalized) >= minimum_targets:
                     break
         return normalized or [SourceTarget(url=f"https://en.wikipedia.org/w/index.php?search={quote_plus(goal + ' list')}", expected_source_type="html_table")]
 
     def _deterministic_fallback_urls(self, goal: str) -> list[str]:
-        return [
+        discovery_urls = [candidate.url for candidate in self.source_discovery.discover(goal, limit=6)]
+        return discovery_urls + [
             f"https://en.wikipedia.org/w/index.php?search={quote_plus(goal + ' list')}",
             f"https://www.wikidata.org/w/index.php?search={quote_plus(goal)}",
         ]
@@ -780,9 +810,15 @@ class DatasetArchitect:
 
     def _generic_directory_blueprint(self, goal: str) -> DatasetBlueprint:
         """Build a generic list-friendly blueprint when all LLM attempts fail."""
+        discovered_urls = [candidate.url for candidate in self.source_discovery.discover(goal, limit=8)]
         adapter_urls = adapter_urls_for_goal(goal)
-        if adapter_urls:
-            ranked = self.source_ranker.rank(goal, adapter_urls)[:3]
+        candidate_urls = discovered_urls or adapter_urls
+        if candidate_urls:
+            ranked = self.source_ranker.rank(
+                goal,
+                candidate_urls,
+                context={"query_terms": self.source_discovery.search_queries(goal)},
+            )[:4]
             source_targets = [
                 SourceTarget(url=item.url, expected_source_type="html_table")
                 for item in ranked
@@ -797,7 +833,7 @@ class DatasetArchitect:
         return DatasetBlueprint(
             dataset_name=_sanitize_dataset_name(goal),
             dataset_description=f"General-purpose directory dataset for: {goal}",
-            target_record_count=50,
+            target_record_count=decompose_goal(goal).row_count_hint or 50,
             source_targets=source_targets,
             row_schema=GeneratedRowSchema(
                 title="SupervisedLearningRecord",
@@ -846,7 +882,8 @@ class DatasetArchitect:
     def _allow_duplicate_domains(self, goal: str) -> bool:
         lowered = goal.lower()
         return (
-            ("state" in lowered and "population" in lowered)
+            self._should_use_deterministic_blueprint(goal)
+            or ("state" in lowered and "population" in lowered)
             or ("ncaa" in lowered and "basketball" in lowered and "team statistics" in lowered)
             or (
                 any(token in lowered for token in ("laptop", "laptops", "notebook", "notebooks"))
@@ -886,6 +923,7 @@ class DatasetArchitect:
                 any(token in lowered for token in ("startup", "startups"))
                 and any(token in lowered for token in ("valuation", "valued", "label"))
             )
+            or ("fortune 500" in lowered or "fortune500" in lowered)
             or (
                 any(token in lowered for token in ("laptop", "laptops", "notebook", "notebooks"))
                 and any(token in lowered for token in ("spec", "specs", "price", "prices", "pc"))
@@ -1174,6 +1212,76 @@ class DatasetArchitect:
                         ),
                     ],
                     required=["company", "valuation"],
+                ),
+            )
+
+        if "fortune 500" in lowered or "fortune500" in lowered:
+            return DatasetBlueprint(
+                dataset_name="Fortune 500 Company Financials",
+                dataset_description="Dataset of Fortune 500 companies with revenue targets and visible company profile features.",
+                target_record_count=100,
+                source_targets=[
+                    SourceTarget(
+                        url="https://en.wikipedia.org/wiki/List_of_Fortune_500_companies",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://companiesmarketcap.com/largest-companies-by-revenue/",
+                        expected_source_type="html_table",
+                    ),
+                    SourceTarget(
+                        url="https://fortune.com/ranking/fortune500/",
+                        expected_source_type="html_table",
+                    ),
+                ],
+                row_schema=GeneratedRowSchema(
+                    title="Fortune500CompanyRow",
+                    description="One Fortune 500 company represented as a revenue prediction row.",
+                    target_field="revenue_usd_millions",
+                    fields=[
+                        SchemaPropertySpec(
+                            name="company_name",
+                            type="string",
+                            description="Company name identifying the row.",
+                        ),
+                        SchemaPropertySpec(
+                            name="revenue_usd_millions",
+                            type="number",
+                            description="Annual revenue in millions of U.S. dollars. This is the supervised learning target.",
+                            ml_role="target",
+                        ),
+                        SchemaPropertySpec(
+                            name="rank",
+                            type="number",
+                            description="Fortune ranking position. This predictive feature captures relative company scale.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="revenue_growth",
+                            type="number",
+                            description="Revenue growth rate when visible. This predictive feature captures recent momentum.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="employees",
+                            type="number",
+                            description="Employee count when visible. This predictive feature captures organizational scale.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="headquarters",
+                            type="string",
+                            description="Headquarters location. This predictive feature captures geographic and regulatory context.",
+                            nullable=True,
+                        ),
+                        SchemaPropertySpec(
+                            name="industry",
+                            type="string",
+                            description="Industry classification. This predictive feature captures sector effects.",
+                            nullable=True,
+                        ),
+                    ],
+                    required=["company_name", "revenue_usd_millions"],
                 ),
             )
 

@@ -149,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"CSV: {artifacts.csv_path}")
         print(f"Parquet: {artifacts.parquet_path}")
         print(f"Profile: {artifacts.profile_path}")
+        print(f"Validation: {artifacts.validation_path}")
         print(f"Rows: {artifacts.rows}")
         print(f"Columns: {artifacts.columns}")
         return 0

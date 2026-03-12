@@ -5,18 +5,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from io import StringIO
+import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import urllib3
 
+from crawlee_fetcher import CrawleeFetcher
 from entity_resolver import EntityResolver
 from goal_intent import infer_domain_intent, infer_entity_intent, infer_goal_cardinality
+from llm import LLMError, LLMGateway
 from source_adapters import adapter_urls_for_goal
+from source_discovery import SourceDiscoveryEngine
 from source_health import FailureReason, fetch_url, REGISTRY
 from source_ranker import SourceRanker
 
@@ -24,6 +28,8 @@ from source_ranker import SourceRanker
 LOGGER = logging.getLogger(__name__)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 IDENTITY_COLUMNS = {"name", "entity_name", "raw_entity_name", "source_url"}
+PROTECTED_METADATA_COLUMNS = {"name", "entity_name", "raw_entity_name", "source", "source_url"}
+PredictiveProgressCallback = Callable[[str, dict[str, Any] | None], None]
 
 
 class DataQualityError(RuntimeError):
@@ -133,7 +139,14 @@ class PredictiveDatasetBuilder:
     core_feature_fields: list[str] = field(default_factory=list)
     domain_blacklist: set[str] = field(default_factory=set)
     source_ranker: SourceRanker = field(default_factory=SourceRanker)
+    source_discovery: SourceDiscoveryEngine = field(default_factory=SourceDiscoveryEngine)
     entity_resolver: EntityResolver = field(default_factory=EntityResolver)
+    progress_callback: PredictiveProgressCallback | None = None
+    llm_gateway: LLMGateway | None = None
+    crawlee_fetcher: CrawleeFetcher = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.crawlee_fetcher = CrawleeFetcher(timeout_seconds=self.timeout_seconds)
 
     def is_applicable(self) -> bool:
         tokens = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
@@ -170,6 +183,8 @@ class PredictiveDatasetBuilder:
             if self._numeric_feature_count(keyed) >= 3:
                 numeric_rich_frame_seen = True
 
+        prepared_frames = self._goal_specific_frame_subset(prepared_frames)
+
         if numeric_rich_frame_seen:
             prepared_frames = [
                 frame
@@ -200,8 +215,14 @@ class PredictiveDatasetBuilder:
             return None
 
         merged = self._finalize_frame(merged)
-        self._enforce_fill_rate(merged)
+        merged_quality_error: DataQualityError | None = None
+        try:
+            self._enforce_fill_rate(merged)
+        except DataQualityError as exc:
+            merged_quality_error = exc
         if (
+            merged_quality_error is None
+            and
             len(merged) >= self.minimum_rows
             and len(merged.columns) >= self.minimum_columns
             and self._frame_row_count_is_reasonable(merged)
@@ -219,38 +240,102 @@ class PredictiveDatasetBuilder:
             or not self._frame_row_count_is_reasonable(best_frame)
         ):
             return None
-        self._enforce_fill_rate(best_frame)
+        try:
+            self._enforce_fill_rate(best_frame)
+        except DataQualityError:
+            if merged_quality_error is not None:
+                raise merged_quality_error
+            raise
         best_provenance = self._finalize_provenance(
             best_frame,
             dict(getattr(best_frame, "attrs", {}).get("provenance_map", {})),
         )
         return PredictiveBuildResult(dataframe=best_frame, provenance_map=best_provenance)
 
+    def _goal_specific_frame_subset(self, frames: list[pd.DataFrame]) -> list[pd.DataFrame]:
+        if not frames:
+            return frames
+        goal_tokens = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
+        if "fortune" in goal_tokens:
+            fortune_frames = [
+                frame
+                for frame in frames
+                if any(
+                    token in str(getattr(frame, "attrs", {}).get("source_ref", "")).lower()
+                    for token in ("fortune_500", "fortune500", "list_of_fortune_500_companies")
+                )
+            ]
+            if fortune_frames:
+                return fortune_frames
+        return frames
+
     def _candidate_frames(self) -> list[pd.DataFrame]:
         frames: list[pd.DataFrame] = []
         seen_urls: set[str] = set()
-        for ranked_source in self._ranked_urls():
+        ranked_urls = self._ranked_urls()
+        total_candidates = len(ranked_urls)
+        for index, ranked_source in enumerate(ranked_urls, start=1):
             url = ranked_source.url
             if url in seen_urls:
                 continue
             seen_urls.add(url)
+            self._notify_progress(
+                f"Checking source {index} of {total_candidates}",
+                {
+                    "url": url,
+                    "source_family": getattr(ranked_source, "family", "unknown"),
+                    "candidate_index": index,
+                    "candidate_total": total_candidates,
+                },
+            )
             extracted = self._extract_tables(url)
             if not extracted:
+                self._notify_progress(
+                    "Source did not yield usable tables",
+                    {
+                        "url": url,
+                        "candidate_index": index,
+                        "candidate_total": total_candidates,
+                    },
+                )
                 continue
             frames.extend(extracted)
+            self._notify_progress(
+                "Extracted candidate tables",
+                {
+                    "url": url,
+                    "tables_found": len(extracted),
+                    "candidate_index": index,
+                    "candidate_total": total_candidates,
+                },
+            )
         return frames
 
     def _ranked_urls(self) -> list[Any]:
-        return self.source_ranker.rank(self.goal, self._expand_urls())[: self.max_candidate_urls]
+        discovered = self.source_discovery.discover(
+            self.goal,
+            forbidden_domains=self.domain_blacklist,
+            limit=self.max_candidate_urls,
+        )
+        return self.source_ranker.rank(
+            self.goal,
+            self._expand_urls(),
+            context={
+                "source_family_by_url": {candidate.url: candidate.family for candidate in discovered},
+                "preferred_domains": tuple(_root_domain(candidate.url) for candidate in discovered),
+                "query_terms": self.source_discovery.search_queries(self.goal),
+            },
+        )[: self.max_candidate_urls]
 
     def _expand_urls(self) -> list[str]:
         expanded = list(self.starting_urls)
+        expanded.extend(candidate.url for candidate in self.source_discovery.discover(self.goal, limit=8))
         if not expanded:
             expanded.extend(adapter_urls_for_goal(self.goal))
             expanded.extend(self._goal_supplemental_urls())
         for url in list(expanded):
             expanded.extend(self._derived_companion_urls(url))
-        return [
+        filtered_urls = [
             url
             for url in expanded
             if (
@@ -259,6 +344,23 @@ class PredictiveDatasetBuilder:
                 and not REGISTRY.should_cooldown(url)
             )
         ]
+        return self._goal_specific_url_subset(filtered_urls)
+
+    def _goal_specific_url_subset(self, urls: list[str]) -> list[str]:
+        if infer_domain_intent(self.goal) == "nba" and infer_entity_intent(self.goal) == "player":
+            allowed_domains = (
+                "espn.com",
+                "hoopshype.com",
+                "basketball-reference.com",
+                "nba.com",
+            )
+            preferred = [
+                url for url in urls
+                if any(domain in _root_domain(url) for domain in allowed_domains)
+            ]
+            if preferred:
+                return preferred[:6]
+        return urls
 
     def _goal_supplemental_urls(self) -> list[str]:
         lowered = self.goal.lower()
@@ -349,6 +451,8 @@ class PredictiveDatasetBuilder:
         extracted: list[pd.DataFrame] = []
         for table in self._combine_related_tables(tables):
             frame = self._flatten_columns(table)
+            frame = self._clean_table_rows(frame)
+            frame = self._drop_empty_rows_and_columns(frame)
             frame = self._prefix_metric_columns(frame, url)
             if len(frame) < self.minimum_rows:
                 continue
@@ -390,6 +494,8 @@ class PredictiveDatasetBuilder:
             if not page_tables:
                 continue
             frame = self._flatten_columns(page_tables[0])
+            frame = self._clean_table_rows(frame)
+            frame = self._drop_empty_rows_and_columns(frame)
             frame = self._prefix_ncaa_metric_columns(frame, url)
             frame = self._prefix_metric_columns(frame, page_url)
             if len(frame) == 0:
@@ -406,17 +512,9 @@ class PredictiveDatasetBuilder:
         return [combined]
 
     def _fetch_html(self, url: str) -> str:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; PredictiveDatasetBuilder/1.0; "
-                "+https://example.com/web-scraper)"
-            )
-        }
-        outcome = fetch_url(
+        outcome = self.crawlee_fetcher.fetch_html(
             url,
-            headers=headers,
-            timeout_seconds=self.timeout_seconds,
-            verify=False,
+            expected_source_type="html_table",
         )
         if outcome.reason in {FailureReason.HTTP_403, FailureReason.HTTP_429, FailureReason.ANTI_BOT}:
             self._blacklist_domain(url)
@@ -426,26 +524,18 @@ class PredictiveDatasetBuilder:
             return ""
         return outcome.text
 
+    def _notify_progress(self, message: str, detail: dict[str, Any] | None = None) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(message, detail)
+
     def _discover_ncaa_team_stat_urls(self, url: str) -> list[str]:
-        outcome = fetch_url(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (compatible; PredictiveDatasetBuilder/1.0; "
-                    "+https://example.com/web-scraper)"
-                )
-            },
-            timeout_seconds=self.timeout_seconds,
-            verify=False,
-        )
-        if outcome.reason in {FailureReason.HTTP_403, FailureReason.HTTP_429, FailureReason.ANTI_BOT}:
-            self._blacklist_domain(url)
-        if not outcome.ok:
+        html = self._fetch_html(url)
+        if not html:
             return []
 
         discovered = re.findall(
-            r'<option value="(/stats/basketball-men/d1/current/team/\d+)">',
-            outcome.text,
+            r'<option[^>]+value=["\'](/stats/basketball-men/d1/current/team/\d+)["\']',
+            html,
             flags=re.IGNORECASE,
         )
         filtered: list[str] = []
@@ -494,39 +584,46 @@ class PredictiveDatasetBuilder:
             return None
 
         working = self._clean_table_rows(frame.copy())
+        working = self._drop_empty_rows_and_columns(working)
         working = working[working[key_column].notna()]
         working[key_column] = working[key_column].astype(str).str.strip()
         working = working[~working[key_column].isin({"", key_column})]
+        working = self._drop_aggregate_entities(working, key_column=key_column)
         if len(working) < self.minimum_rows:
             return None
 
-        working = working.drop_duplicates(subset=[key_column])
         if key_column != "entity_name":
             working["entity_name"] = working[key_column].map(self._normalize_entity_name)
         else:
             working["entity_name"] = working["entity_name"].astype(str).map(self._normalize_entity_name)
         working = self.entity_resolver.resolve_frame(working, entity_column="entity_name")
+        working = self._coalesce_duplicate_entities(working)
 
         renamed: dict[str, str] = {}
+        required_schema_fields = set(self._expected_schema_fields())
         for column in working.columns:
             if column == key_column:
                 continue
             if column == "_source_url":
                 renamed[column] = "source_url"
                 continue
-            if column in DROP_COLUMNS:
+            if column in DROP_COLUMNS and column not in required_schema_fields:
                 continue
             renamed[column] = column
 
         selected_columns = ["entity_name"]
         if key_column != "entity_name":
             selected_columns.append(key_column)
-        selected_columns.extend(col for col in renamed if col not in DROP_COLUMNS)
+        selected_columns.extend(
+            col for col in renamed
+            if col not in DROP_COLUMNS or col in required_schema_fields
+        )
         trimmed = working.loc[:, ~working.columns.duplicated()][selected_columns].copy()
         if key_column not in {"entity_name", "raw_entity_name"}:
             trimmed = trimmed.rename(columns={key_column: "raw_entity_name"})
         trimmed = trimmed.rename(columns=renamed)
         trimmed = trimmed.loc[:, ~trimmed.columns.duplicated()]
+        trimmed = self._collapse_duplicate_named_columns(trimmed)
         trimmed = self._convert_numeric_columns(trimmed)
         trimmed = self._drop_low_value_columns(trimmed)
         source_ref = self._frame_source_reference(working)
@@ -543,7 +640,7 @@ class PredictiveDatasetBuilder:
         left = left.copy()
         right = right.copy()
 
-        for identifier in ("raw_entity_name", "source_url", "name"):
+        for identifier in ("raw_entity_name", "name"):
             if identifier in left.columns and identifier in right.columns:
                 right = right.drop(columns=[identifier])
 
@@ -560,15 +657,29 @@ class PredictiveDatasetBuilder:
         if "raw_entity_name_x" in merged.columns and "raw_entity_name_y" in merged.columns:
             merged["raw_entity_name"] = merged["raw_entity_name_x"].fillna(merged["raw_entity_name_y"])
             merged = merged.drop(columns=["raw_entity_name_x", "raw_entity_name_y"])
+        if "source_url_x" in merged.columns or "source_url_y" in merged.columns:
+            merged["source_url"] = self._merge_source_columns(
+                merged.get("source_url_x"),
+                merged.get("source_url_y"),
+            )
+            merged = merged.drop(
+                columns=[column for column in ("source_url_x", "source_url_y") if column in merged.columns]
+            )
         for column in overlapping:
             rhs_column = f"{column}__rhs"
             if rhs_column not in merged.columns:
                 continue
             if column in merged.columns:
-                merged[column] = merged[column].combine_first(merged[rhs_column])
+                if column == "source_url":
+                    merged[column] = self._merge_source_columns(merged[column], merged[rhs_column])
+                else:
+                    merged[column] = merged[column].combine_first(merged[rhs_column])
                 merged = merged.drop(columns=[rhs_column])
             else:
                 merged = merged.rename(columns={rhs_column: column})
+        merged = self._collapse_duplicate_named_columns(merged)
+        merged = self._coalesce_duplicate_entities(merged)
+        merged.attrs["provenance_map"] = self._merge_provenance_maps(left, right, merged)
         return merged
 
     def _finalize_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -577,6 +688,9 @@ class PredictiveDatasetBuilder:
             finalized = finalized.rename(columns={"raw_entity_name": "name"})
         finalized = finalized.drop_duplicates(subset=["entity_name"])
         finalized = finalized.rename(columns=self._final_column_label_map(finalized.columns))
+        finalized = self._collapse_duplicate_named_columns(finalized)
+        finalized = self._apply_schema_aliases(finalized)
+        finalized = self._drop_duplicate_value_columns(finalized)
 
         ordered = self._order_final_columns(finalized)
         finalized = finalized[[column for column in ordered if column in finalized.columns]]
@@ -587,7 +701,7 @@ class PredictiveDatasetBuilder:
             column
             for column in finalized.columns
             if (
-                column in {"name", "entity_name"}
+                column in {"name", "entity_name", *self._expected_schema_fields()}
                 or (
                     finalized[column].notna().sum() >= null_threshold
                     and not self._is_low_signal_column(column, finalized[column])
@@ -596,7 +710,285 @@ class PredictiveDatasetBuilder:
         ]
         finalized = finalized[keep_columns]
         finalized = self._trim_excess_columns(finalized)
+        finalized = self.prune_dataset(finalized, self.target_field or "")
         return finalized.reset_index(drop=True)
+
+    def prune_dataset(self, df: pd.DataFrame, target_col: str) -> pd.DataFrame:
+        """Drop unusable rows and columns before the final ML quality gate."""
+        pruned = df.copy()
+        if pruned.empty:
+            return pruned
+
+        target_column = self._resolve_quality_column(pruned, [target_col] if target_col else [])
+        if target_column is None:
+            LOGGER.info("Skipping dataset pruning because target column '%s' could not be resolved", target_col)
+            return pruned.reset_index(drop=True)
+
+        original_row_count = len(pruned)
+        original_columns = list(map(str, pruned.columns))
+
+        missing_target_mask = self._series_missing_mask(pruned[target_column])
+        rows_missing_target = int(missing_target_mask.sum())
+        if rows_missing_target:
+            pruned = pruned.loc[~missing_target_mask].copy()
+
+        feature_columns = [
+            column
+            for column in pruned.columns
+            if column != target_column and str(column) not in PROTECTED_METADATA_COLUMNS
+        ]
+        rows_sparse_features = 0
+        if feature_columns:
+            feature_missing = pd.DataFrame(
+                {str(column): self._series_missing_mask(pruned[column]) for column in feature_columns},
+                index=pruned.index,
+            )
+            rows_sparse_mask = feature_missing.mean(axis=1) > 0.50
+            rows_sparse_features = int(rows_sparse_mask.sum())
+            if rows_sparse_features:
+                pruned = pruned.loc[~rows_sparse_mask].copy()
+
+        sparse_columns = [
+            str(column)
+            for column in pruned.columns
+            if column != target_column and self._missing_rate(pruned[column]) > 0.40
+        ]
+        if sparse_columns:
+            pruned = pruned.drop(columns=sparse_columns, errors="ignore")
+
+        zero_variance_columns = [
+            str(column)
+            for column in pruned.columns
+            if column != target_column and self._has_zero_variance(pruned[column])
+        ]
+        if zero_variance_columns:
+            pruned = pruned.drop(columns=zero_variance_columns, errors="ignore")
+
+        semantic_columns = self._semantic_prune_columns(pruned, target_column=target_column)
+        if semantic_columns:
+            pruned = pruned.drop(columns=semantic_columns, errors="ignore")
+
+        remaining_columns = [column for column in original_columns if column in pruned.columns]
+        pruned = pruned.loc[:, remaining_columns]
+        LOGGER.info(
+            "Pruned dataset rows/columns: dropped %d rows missing target, %d rows with >50%% missing features, %d sparse columns, %d zero-variance columns, %d semantically irrelevant columns",
+            rows_missing_target,
+            rows_sparse_features,
+            len(sparse_columns),
+            len(zero_variance_columns),
+            len(semantic_columns),
+        )
+        if sparse_columns:
+            LOGGER.info("Dropped sparse columns: %s", ", ".join(sorted(sparse_columns)))
+        if zero_variance_columns:
+            LOGGER.info("Dropped zero-variance columns: %s", ", ".join(sorted(zero_variance_columns)))
+        if semantic_columns:
+            LOGGER.info("Dropped semantically irrelevant columns for target '%s': %s", target_column, ", ".join(sorted(semantic_columns)))
+        LOGGER.info("Dataset size changed from %d rows / %d columns to %d rows / %d columns", original_row_count, len(original_columns), len(pruned), len(pruned.columns))
+        return pruned.reset_index(drop=True)
+
+    def _apply_schema_aliases(self, frame: pd.DataFrame) -> pd.DataFrame:
+        aliased = frame.copy()
+        for field_name in self._expected_schema_fields():
+            if field_name in aliased.columns:
+                continue
+            matched = self._match_schema_column(aliased, field_name)
+            if matched is None or matched == field_name:
+                continue
+            aliased[field_name] = aliased[matched]
+        return aliased
+
+    def _expected_schema_fields(self) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for field_name in [*self.core_feature_fields, self.target_field]:
+            if not field_name or field_name in seen:
+                continue
+            seen.add(field_name)
+            ordered.append(field_name)
+        return ordered
+
+    def _match_schema_column(self, frame: pd.DataFrame, field_name: str) -> str | None:
+        best_column: str | None = None
+        best_score = 0
+        best_coverage = -1.0
+        for column in map(str, frame.columns):
+            if column in {"entity_name", "source"}:
+                continue
+            score = self._score_schema_column(field_name=field_name, column_name=column)
+            coverage = float(frame[column].notna().mean()) if column in frame.columns else 0.0
+            if score > best_score or (score == best_score and coverage > best_coverage):
+                best_column = column
+                best_score = score
+                best_coverage = coverage
+        if best_score < 4:
+            return None
+        return best_column
+
+    def _score_schema_column(self, *, field_name: str, column_name: str) -> int:
+        field_normalized = self._normalize_column_name(field_name)
+        column_normalized = self._normalize_column_name(column_name)
+        if not column_normalized or column_normalized in {"rank", "geo_sort", "source"}:
+            return 0
+
+        aliases = {
+            "state": (
+                {"state"},
+                {"territory"},
+                {"district"},
+                {"federal", "district"},
+                {"name"},
+            ),
+            "bank": (
+                {"bank"},
+                {"name"},
+            ),
+            "company": (
+                {"company"},
+                {"name"},
+            ),
+            "company_name": (
+                {"company"},
+                {"name"},
+            ),
+            "population": (
+                {"population"},
+                {"pop"},
+                {"census", "population"},
+            ),
+            "population_growth_rate": (
+                {"population", "growth"},
+                {"population", "change"},
+                {"pop", "change"},
+                {"growth", "rate"},
+                {"percent", "change"},
+                {"change"},
+            ),
+            "gdp": (
+                {"gdp"},
+                {"gross", "domestic", "product"},
+                {"nominal", "gdp"},
+            ),
+            "gdp_growth_rate": (
+                {"gdp", "growth"},
+                {"gdp", "percent", "change"},
+                {"economic", "growth", "rate"},
+                {"real", "gdp", "growth", "rate"},
+            ),
+            "rank": (
+                {"rank"},
+                {"fortune", "rank"},
+            ),
+            "revenue_usd_millions": (
+                {"revenue"},
+                {"revenues"},
+            ),
+            "revenue_growth": (
+                {"revenue", "growth"},
+                {"growth"},
+            ),
+            "employees": (
+                {"employees"},
+            ),
+            "headquarters": (
+                {"headquarters"},
+                {"hq"},
+            ),
+            "industry": (
+                {"industry"},
+                {"sector"},
+            ),
+            "price_usd": (
+                {"price"},
+                {"msrp"},
+                {"cost"},
+            ),
+            "salary": (
+                {"salary"},
+                {"2025", "26"},
+                {"2026", "27"},
+            ),
+            "player": (
+                {"player"},
+                {"name"},
+            ),
+            "points_per_game": (
+                {"points"},
+                {"pts"},
+                {"ppg"},
+            ),
+            "assists_per_game": (
+                {"assists"},
+                {"ast"},
+                {"apg"},
+            ),
+            "rebounds_per_game": (
+                {"rebounds"},
+                {"reb"},
+                {"rpg"},
+                {"trb"},
+            ),
+            "minutes_per_game": (
+                {"minutes"},
+                {"min"},
+                {"mpg"},
+                {"mp"},
+            ),
+        }
+        text = f"{column_name} {column_normalized}"
+        tokens = {
+            token
+            for token in re.split(r"[^a-z0-9]+", text.lower())
+            if token
+        }
+        accepted_groups = aliases.get(field_name, ({field_normalized},))
+        score = 0
+        for group in accepted_groups:
+            if all(token in tokens for token in group):
+                score = max(score, len(group) * 3)
+        if column_normalized == field_normalized:
+            score = max(score, 7)
+        elif column_normalized.startswith(field_normalized) or field_normalized in column_normalized:
+            score = max(score, 4)
+
+        if field_name == "population_growth_rate":
+            if "gdp" in tokens:
+                return 0
+            if "population" in tokens and any(token in tokens for token in {"growth", "change"}):
+                score = max(score, 9)
+            elif "change" in tokens and "gdp" not in tokens:
+                score = max(score, 5)
+        elif field_name == "gdp":
+            if any(token in tokens for token in {"growth", "change", "percent", "rate"}):
+                return 0
+            if "gdp" in tokens:
+                score = max(score, 8)
+        elif field_name == "gdp_growth_rate":
+            if "gdp" in tokens and any(token in tokens for token in {"growth", "change"}):
+                score = max(score, 9)
+        elif field_name in {"bank", "company", "company_name", "state"} and column_normalized == "name":
+            score = max(score, 6)
+        elif field_name == "rank" and "revenue" in tokens:
+            return 0
+        elif field_name == "revenue_usd_millions" and "growth" in tokens:
+            return 0
+        elif field_name == "salary":
+            if "rk" in tokens or "rank" in tokens:
+                score = min(score, 2)
+            if "salary" in tokens:
+                score = max(score, 8)
+            if "2025" in tokens and "26" in tokens:
+                score = max(score, 9)
+        elif field_name == "points_per_game" and ("pts" in tokens or "points" in tokens):
+            score = max(score, 8)
+        elif field_name == "assists_per_game" and ("ast" in tokens or "assists" in tokens):
+            score = max(score, 8)
+        elif field_name == "rebounds_per_game" and ("reb" in tokens or "rebounds" in tokens or "trb" in tokens):
+            score = max(score, 8)
+        elif field_name == "minutes_per_game" and ("min" in tokens or "minutes" in tokens or "mp" in tokens):
+            score = max(score, 8)
+
+        return score
 
     def _final_column_label_map(self, columns: pd.Index) -> dict[str, str]:
         rename_map: dict[str, str] = {}
@@ -629,6 +1021,9 @@ class PredictiveDatasetBuilder:
 
     def _order_final_columns(self, frame: pd.DataFrame) -> list[str]:
         preferred = ["name", "entity_name"]
+        for field_name in self._expected_schema_fields():
+            if field_name in frame.columns and field_name not in preferred:
+                preferred.append(field_name)
         columns = [column for column in frame.columns if column not in preferred]
         goal_tokens = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
 
@@ -651,7 +1046,7 @@ class PredictiveDatasetBuilder:
         if len(frame.columns) <= max_columns:
             return frame
 
-        protected = {"name", "entity_name"}
+        protected = {"name", "entity_name", *self._expected_schema_fields()}
         ranked_columns = []
         for column in frame.columns:
             if column in protected:
@@ -717,13 +1112,20 @@ class PredictiveDatasetBuilder:
     def _resolve_quality_column(self, frame: pd.DataFrame, field_names: list[str]) -> str | None:
         if not field_names:
             return None
-        columns = list(map(str, frame.columns))
-        normalized_columns = {column: self._normalize_column_name(column) for column in columns}
         for field_name in field_names:
             if not field_name:
                 continue
             if field_name in frame.columns:
                 return field_name
+        for field_name in field_names:
+            matched = self._match_schema_column(frame, field_name)
+            if matched is not None:
+                return matched
+        columns = list(map(str, frame.columns))
+        normalized_columns = {column: self._normalize_column_name(column) for column in columns}
+        for field_name in field_names:
+            if not field_name:
+                continue
             normalized_field = self._normalize_column_name(field_name)
             for column, normalized_column in normalized_columns.items():
                 if normalized_column == normalized_field:
@@ -750,11 +1152,96 @@ class PredictiveDatasetBuilder:
     def _missing_rate(self, series: pd.Series) -> float:
         if len(series) == 0:
             return 1.0
+        return float(self._series_missing_mask(series).mean())
+
+    def _series_missing_mask(self, series: pd.Series) -> pd.Series:
         missing = series.isna()
         if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
             normalized = series.fillna("").astype(str).str.strip().str.casefold()
             missing = missing | normalized.isin({"", "unknown", "n/a", "na", "none", "null"})
-        return float(missing.mean())
+        return missing
+
+    def _has_zero_variance(self, series: pd.Series) -> bool:
+        if len(series) == 0:
+            return True
+        non_missing = series.loc[~self._series_missing_mask(series)]
+        if non_missing.empty:
+            return True
+        normalized = non_missing.map(lambda value: str(value).strip().casefold() if isinstance(value, str) else value)
+        return normalized.nunique(dropna=True) <= 1
+
+    def _semantic_prune_columns(self, frame: pd.DataFrame, *, target_column: str) -> list[str]:
+        candidate_columns = [
+            str(column)
+            for column in frame.columns
+            if column != target_column and str(column) not in PROTECTED_METADATA_COLUMNS
+        ]
+        if not candidate_columns:
+            return []
+
+        gateway = self._get_semantic_pruning_gateway()
+        if gateway is None:
+            return []
+
+        system_prompt = (
+            "You are a machine learning feature-pruning assistant. "
+            "Review candidate dataset columns and identify columns that are clearly UI artifacts, random noise, page chrome, rankings-only clutter, or otherwise irrelevant to predicting the target variable. "
+            "Be conservative: keep plausible business, statistical, demographic, operational, or domain features. "
+            "Return JSON only."
+        )
+        user_prompt = (
+            f"Identify any columns in this list that are clearly UI artifacts, random noise, or completely irrelevant to predicting the target variable '{target_column}'. "
+            "Return a JSON list of column names to drop.\n\n"
+            f"Columns:\n{json.dumps(candidate_columns, indent=2)}"
+        )
+        try:
+            response = gateway.complete_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=300,
+            )
+            parsed = self._parse_json_list(response)
+        except LLMError as exc:
+            LOGGER.warning("Semantic pruning skipped because the LLM call failed: %s", exc)
+            return []
+        except ValueError as exc:
+            LOGGER.warning("Semantic pruning skipped because the LLM returned invalid JSON: %s", exc)
+            return []
+
+        seen: set[str] = set()
+        drops: list[str] = []
+        valid_columns = set(candidate_columns)
+        for column in parsed:
+            normalized = str(column).strip()
+            if normalized in valid_columns and normalized not in seen:
+                seen.add(normalized)
+                drops.append(normalized)
+        return drops
+
+    def _get_semantic_pruning_gateway(self) -> LLMGateway | None:
+        if self.llm_gateway is not None:
+            return self.llm_gateway
+        try:
+            self.llm_gateway = LLMGateway(model="gpt-4o-mini", max_tokens=400)
+        except LLMError as primary_exc:
+            LOGGER.warning("Fast semantic pruning model unavailable: %s", primary_exc)
+            try:
+                self.llm_gateway = LLMGateway(max_tokens=400)
+            except LLMError as fallback_exc:
+                LOGGER.warning("Semantic pruning disabled because no LLM gateway is available: %s", fallback_exc)
+                return None
+        return self.llm_gateway
+
+    def _parse_json_list(self, value: str) -> list[str]:
+        cleaned = value.strip()
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start : end + 1]
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, list):
+            raise ValueError("Expected a JSON list")
+        return [str(item) for item in parsed if isinstance(item, str)]
 
     def _drop_low_value_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
         keep = ["entity_name"]
@@ -762,6 +1249,11 @@ class PredictiveDatasetBuilder:
             keep.append("raw_entity_name")
         if "source_url" in frame.columns:
             keep.append("source_url")
+        keep.extend(
+            field_name
+            for field_name in self._expected_schema_fields()
+            if field_name in frame.columns and field_name not in keep
+        )
 
         for column in frame.columns:
             if column in keep:
@@ -816,6 +1308,7 @@ class PredictiveDatasetBuilder:
         return max(
             frames,
             key=lambda frame: (
+                self._frame_target_coverage_score(frame),
                 self._row_count_score(len(frame)),
                 self._frame_goal_alignment_score(frame),
                 self._numeric_feature_count(frame),
@@ -823,6 +1316,15 @@ class PredictiveDatasetBuilder:
                 len(frame),
             ),
         )
+
+    def _frame_target_coverage_score(self, frame: pd.DataFrame) -> tuple[int, float]:
+        if not self.target_field:
+            return (0, 0.0)
+        target_column = self._resolve_quality_column(frame, [self.target_field])
+        if target_column is None:
+            return (0, 0.0)
+        coverage = float(frame[target_column].notna().mean())
+        return (1, coverage)
 
     def _row_count_score(self, row_count: int) -> float:
         cardinality = infer_goal_cardinality(self.goal)
@@ -881,10 +1383,17 @@ class PredictiveDatasetBuilder:
 
         if "company" in goal_tokens and entity_column == "company":
             score += 8
+        if "company" in goal_tokens and entity_column == "name":
+            score += 4
         if "bank" in goal_tokens and entity_column == "bank":
             score += 8
         if "school" in goal_tokens and entity_column == "school":
             score += 8
+        if "fortune" in goal_tokens:
+            if any(token in source_ref for token in ("fortune_500", "fortune500", "list_of_fortune_500_companies")):
+                score += 12
+            if "companiesmarketcap" in source_ref:
+                score -= 8
 
         sample_names = [
             str(value).strip().lower()
@@ -947,7 +1456,10 @@ class PredictiveDatasetBuilder:
             ],
             ignore_index=True,
         )
-        return combined.drop_duplicates(subset=["entity_name"])
+        combined = self._collapse_duplicate_named_columns(combined)
+        combined = self._coalesce_duplicate_entities(combined)
+        combined.attrs["provenance_map"] = self._merge_provenance_maps(left, right, combined)
+        return combined
 
     def _frame_source_reference(self, frame: pd.DataFrame) -> str:
         if "_source_url" in frame.columns:
@@ -1111,6 +1623,8 @@ class PredictiveDatasetBuilder:
             "https://www.espn.com/nba/stats/player",
             "https://www.espn.com/nba/salaries",
             "https://hoopshype.com/salaries/players/",
+            "https://www.basketball-reference.com/leagues/NBA_2025_per_game.html",
+            "https://www.basketball-reference.com/leagues/NBA_2025_advanced.html",
             "https://www.nba.com/players",
         ]
 
@@ -1160,24 +1674,10 @@ class PredictiveDatasetBuilder:
         return merged.loc[:, ~merged.columns.duplicated()]
 
     def _extract_transfermarkt_club_summary(self, url: str) -> list[pd.DataFrame]:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; PredictiveDatasetBuilder/1.0; "
-                "+https://example.com/web-scraper)"
-            )
-        }
-        outcome = fetch_url(
-            url,
-            headers=headers,
-            timeout_seconds=max(self.timeout_seconds, 20.0),
-            verify=False,
-        )
-        if outcome.reason in {FailureReason.HTTP_403, FailureReason.HTTP_429, FailureReason.ANTI_BOT}:
-            self._blacklist_domain(url)
-        if not outcome.ok or not outcome.text:
+        html = self._fetch_html(url)
+        if not html:
             REGISTRY.record_extraction(url, records_extracted=0, success=False, reason=FailureReason.EMPTY_CONTENT)
             return []
-        html = outcome.text
         try:
             tables = pd.read_html(StringIO(html))
         except Exception as exc:
@@ -1196,6 +1696,8 @@ class PredictiveDatasetBuilder:
         for index in range(pair_count):
             incoming = self._flatten_columns(detail_tables[index * 2])
             outgoing = self._flatten_columns(detail_tables[index * 2 + 1])
+            incoming = self._clean_table_rows(self._drop_empty_rows_and_columns(incoming))
+            outgoing = self._clean_table_rows(self._drop_empty_rows_and_columns(outgoing))
             club_name = club_names[index]
             rows.append(
                 {
@@ -1237,10 +1739,58 @@ class PredictiveDatasetBuilder:
     def _normalize_entity_name(self, value: str) -> str:
         return self.entity_resolver.canonical_key(value)
 
+    def _drop_aggregate_entities(self, frame: pd.DataFrame, *, key_column: str) -> pd.DataFrame:
+        if "state" not in set(self._expected_schema_fields()):
+            return frame
+        filtered = frame[
+            ~frame[key_column].astype(str).map(self._is_aggregate_entity_name)
+        ]
+        return filtered.reset_index(drop=True)
+
+    def _is_aggregate_entity_name(self, value: str) -> bool:
+        normalized = str(value).strip().casefold()
+        blocked = {
+            "united states",
+            "district of columbia",
+            "puerto rico",
+            "guam",
+            "american samoa",
+            "northern mariana islands",
+            "u.s. virgin islands",
+            "virgin islands",
+            "50 states and district of columbia",
+            "island areas",
+            "island areas territories",
+            "new england",
+            "mid atlantic",
+            "east north central",
+            "west north central",
+            "south atlantic",
+            "east south central",
+            "west south central",
+            "mountain",
+            "pacific",
+            "northeast",
+            "midwest",
+            "south",
+            "west",
+            "unknown",
+        }
+        if normalized in blocked:
+            return True
+        return any(token in normalized for token in ("division", "region", "total"))
+
     def _is_low_signal_column(self, column: str, series: pd.Series) -> bool:
         normalized = str(column).strip().lower()
         if normalized.isdigit() or normalized in {"column", "unnamed", "unnamed_0", "unnamed_1"}:
             return True
+        parts = tuple(part for part in normalized.split("_") if part)
+        if "unnamed" in parts:
+            unnamed_index = parts.index("unnamed")
+            if unnamed_index == len(parts) - 1:
+                return True
+            if parts[unnamed_index + 1].isdigit():
+                return True
         if normalized in {"rk", "rank"} or normalized.endswith("_rk") or "_rank" in normalized:
             return True
         if re.fullmatch(r"\d+", normalized):
@@ -1306,6 +1856,137 @@ class PredictiveDatasetBuilder:
         if domain:
             self.domain_blacklist.add(domain)
 
+    def _drop_empty_rows_and_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        cleaned = frame.copy()
+        cleaned = cleaned.dropna(axis=1, how="all")
+        if cleaned.empty:
+            return cleaned
+        non_empty_mask = cleaned.apply(
+            lambda row: any(str(value).strip().lower() not in {"", "nan", "none", "null"} for value in row.tolist()),
+            axis=1,
+        )
+        return cleaned.loc[non_empty_mask].reset_index(drop=True)
+
+    def _coalesce_duplicate_entities(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if "entity_name" not in frame.columns or frame.empty:
+            return frame
+
+        grouped_rows: list[dict[str, Any]] = []
+        for _, group in frame.groupby("entity_name", dropna=False, sort=False):
+            row = self._coalesce_group(group)
+            if row:
+                grouped_rows.append(row)
+
+        coalesced = pd.DataFrame(grouped_rows)
+        ordered_columns = [column for column in frame.columns if column in coalesced.columns]
+        ordered_columns.extend(column for column in coalesced.columns if column not in ordered_columns)
+        return coalesced.reindex(columns=ordered_columns)
+
+    def _coalesce_group(self, group: pd.DataFrame) -> dict[str, Any]:
+        row: dict[str, Any] = {}
+        for column in group.columns:
+            values = [value for value in group[column].tolist() if not self._is_empty_cell(value)]
+            if not values:
+                row[column] = None
+                continue
+            if column == "source_url" or column == "_source_url":
+                row[column] = self._merge_source_values(values)
+                continue
+            if pd.api.types.is_numeric_dtype(group[column]):
+                row[column] = values[0]
+                continue
+            row[column] = max(values, key=lambda value: len(str(value).strip()))
+        return row
+
+    def _collapse_duplicate_named_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        working = frame.copy()
+        grouped_positions: dict[str, list[int]] = {}
+        columns = list(map(str, working.columns))
+        for index, column in enumerate(columns):
+            grouped_positions.setdefault(column, []).append(index)
+
+        rebuilt: dict[str, pd.Series] = {}
+        for column, positions in grouped_positions.items():
+            series = working.iloc[:, positions[0]].copy()
+            for position in positions[1:]:
+                series = series.combine_first(working.iloc[:, position])
+            rebuilt[column] = series
+        return pd.DataFrame(rebuilt)
+
+    def _drop_duplicate_value_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        protected = {"name", "entity_name", *self._expected_schema_fields()}
+        keep: list[str] = []
+        seen_signatures: set[tuple[Any, ...]] = set()
+        for column in frame.columns:
+            series = frame[column]
+            if column in protected:
+                keep.append(column)
+                continue
+            signature = tuple("" if pd.isna(value) else str(value).strip() for value in series.tolist())
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            keep.append(column)
+        return frame[keep]
+
+    def _merge_source_columns(self, left: pd.Series | None, right: pd.Series | None) -> pd.Series:
+        if left is None and right is None:
+            return pd.Series(dtype="object")
+        if left is None:
+            return right.copy()
+        if right is None:
+            return left.copy()
+        return pd.Series(
+            [
+                self._merge_source_values([left_value, right_value])
+                for left_value, right_value in zip(left.tolist(), right.tolist(), strict=False)
+            ]
+        )
+
+    def _merge_source_values(self, values: list[Any]) -> str | None:
+        unique: list[str] = []
+        for value in values:
+            if self._is_empty_cell(value):
+                continue
+            for part in str(value).split(" | "):
+                cleaned = part.strip()
+                if cleaned and cleaned not in unique:
+                    unique.append(cleaned)
+        if not unique:
+            return None
+        return " | ".join(unique)
+
+    def _merge_provenance_maps(
+        self,
+        left: pd.DataFrame,
+        right: pd.DataFrame,
+        merged: pd.DataFrame,
+    ) -> dict[str, str]:
+        left_map = dict(getattr(left, "attrs", {}).get("provenance_map", {}))
+        right_map = dict(getattr(right, "attrs", {}).get("provenance_map", {}))
+        provenance: dict[str, str] = {}
+        for column in merged.columns:
+            if column == "entity_name":
+                continue
+            left_source = left_map.get(column)
+            right_source = right_map.get(column)
+            if left_source and right_source and left_source != right_source:
+                provenance[column] = f"{left_source} | {right_source}"
+            else:
+                provenance[column] = left_source or right_source or "derived"
+        return provenance
+
+    def _is_empty_cell(self, value: Any) -> bool:
+        if value is None:
+            return True
+        if pd.isna(value):
+            return True
+        if isinstance(value, str) and value.strip().casefold() in {"", "nan", "none", "null", "n/a", "na"}:
+            return True
+        return False
+
 
 @dataclass(slots=True)
 class PredictiveBuildResult:
@@ -1348,6 +2029,7 @@ def _parse_money_value(value: Any) -> float:
     text = text.replace("€", "")
     text = text.replace("$", "")
     text = text.replace("£", "")
+    text = re.sub(r"\b(?:eur|usd|gbp|us\$)\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"loan fee:?", "", text, flags=re.IGNORECASE)
     text = text.strip()
     multiplier = 1.0

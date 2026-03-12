@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from architect import SourceTarget
+from crawlee_fetcher import CrawleeFetchResult
 from extraction_router import ExtractionRouter
 from predictive_dataset_builder import PredictiveDatasetBuilder
 from source_health import FetchOutcome
@@ -27,12 +28,19 @@ class FixtureRouter(ExtractionRouter):
         super().__init__(*args, **kwargs)
         self.fixture_urls = fixture_urls
 
-    def _fetch_html(self, url: str) -> FetchOutcome:
+    def _fetch_html(self, url: str, *, expected_source_type: str = "unknown") -> FetchOutcome:
         fixture_name = self.fixture_urls.get(url)
         if fixture_name is None:
             raise AssertionError(f"Unexpected fixture URL: {url}")
         text = (FIXTURE_ROOT / fixture_name).read_text(encoding="utf-8")
         return FetchOutcome(url=url, ok=True, text=text)
+
+    def _fetch_target(self, source_target: SourceTarget) -> CrawleeFetchResult:
+        outcome = self._fetch_html(
+            source_target.url,
+            expected_source_type=source_target.expected_source_type,
+        )
+        return CrawleeFetchResult(fetch_outcome=outcome)
 
     def _synthesize_payload(self, source_target: SourceTarget, payload: dict, *, strategy: str) -> list[BaseModel]:
         if strategy != "react_state":

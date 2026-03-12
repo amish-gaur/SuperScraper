@@ -120,9 +120,37 @@ Main endpoints:
 
 - `POST /jobs`
 - `GET /jobs/{job_id}`
+- `GET /jobs/{job_id}/profile`
+- `GET /jobs/{job_id}/preview`
 - `GET /jobs/{job_id}/download/csv`
 - `GET /jobs/{job_id}/download/parquet`
 - `GET /jobs/{job_id}/download/profile`
+
+## Local frontend demo
+
+This repo now includes a lightweight React frontend under [`frontend/`](frontend) for local demos.
+
+Run the API in one terminal:
+
+```bash
+uvicorn api:app --reload
+```
+
+Run the frontend in another:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Then open:
+
+```text
+http://localhost:5173
+```
+
+The frontend submits dataset jobs, polls job status, shows pipeline stages, fetches the dataset profile, renders a small row preview, and links to artifact downloads.
 
 ## Important files
 

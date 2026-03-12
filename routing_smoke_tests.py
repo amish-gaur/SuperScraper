@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 
 from pydantic import BaseModel
 
 from architect import DatasetArchitect, DatasetBlueprint, SourceTarget
+from crawlee_fetcher import CrawleeFetchResult, CrawleeStaticRequestProcessor
 from domain_adapters import DomainAdapter
 from extraction_router import ExtractionRouter, StateSniffer
 from source_health import FailureReason, FetchOutcome
@@ -24,6 +26,9 @@ class FakeAdapter(DomainAdapter):
     def matches(self, source_target: SourceTarget) -> bool:
         return "adapter.test" in source_target.url
 
+    def prefers_crawlee(self) -> bool:
+        return False
+
     def fetch_payload(self, source_target: SourceTarget) -> dict | None:
         return self.payload
 
@@ -33,7 +38,12 @@ class TestRouter(ExtractionRouter):
         super().__init__(*args, **kwargs)
         self._test_fetch_outcome = fetch_outcome
 
-    def _fetch_html(self, url: str) -> FetchOutcome:
+    def _fetch_target(self, source_target: SourceTarget) -> CrawleeFetchResult:
+        if self._test_fetch_outcome is None:
+            raise AssertionError("HTML fetch should not have been called")
+        return CrawleeFetchResult(fetch_outcome=self._test_fetch_outcome)
+
+    def _fetch_html(self, url: str, *, expected_source_type: str = "unknown") -> FetchOutcome:
         if self._test_fetch_outcome is None:
             raise AssertionError("HTML fetch should not have been called")
         return self._test_fetch_outcome
@@ -158,6 +168,31 @@ def test_router_uses_state_sniffer_before_browser() -> None:
     assert decision.records[0].name == "state"
 
 
+def test_router_synthesizes_json_payload_for_non_adapter_target() -> None:
+    class JsonRouter(TestRouter):
+        def _fetch_target(self, source_target: SourceTarget) -> CrawleeFetchResult:
+            return CrawleeFetchResult(
+                fetch_outcome=FetchOutcome(
+                    url=source_target.url,
+                    ok=True,
+                    text='{"items":[{"name":"json"}]}',
+                    status_code=200,
+                ),
+                json_payload={"items": [{"name": "json"}]},
+            )
+
+        def _synthesize_payload(self, source_target: SourceTarget, payload: dict, *, strategy: str) -> list[BaseModel]:
+            if strategy == "json_payload":
+                return [self.row_model.model_validate({"name": "json", "source_url": source_target.url})]
+            return super()._synthesize_payload(source_target, payload, strategy=strategy)
+
+    router = JsonRouter(goal="test", row_model=SimpleRow, adapters=[])
+    decision = router.route(SourceTarget(url="https://api.test/data", expected_source_type="json_api"))
+    assert decision.strategy == "json_payload"
+    assert len(decision.records) == 1
+    assert decision.records[0].name == "json"
+
+
 def test_router_falls_back_to_browser_after_fetch_failure() -> None:
     router = TestRouter(
         goal="test",
@@ -192,6 +227,21 @@ def test_router_falls_back_to_browser_when_state_cannot_be_synthesized() -> None
     assert decision.strategy == "browser"
 
 
+def test_static_processor_dedupes_urls_and_tracks_counters() -> None:
+    processor = CrawleeStaticRequestProcessor(timeout_seconds=10.0)
+    targets = [
+        SourceTarget(url="https://example.com", expected_source_type="html_table"),
+        SourceTarget(url="https://example.com", expected_source_type="html_table"),
+    ]
+    fetched = asyncio.run(processor.fetch(targets, adapters=[]))
+    assert len(fetched) == 1
+    assert processor.stats.queued_urls == 1
+    assert processor.stats.deduped_urls == 1
+    assert processor.stats.handled_urls == 1
+    assert processor.stats.artifacts_written == 1
+    assert processor.stats.failed_urls_by_reason == {}
+
+
 def main(*, verbose: bool = True) -> int:
     tests = [
         test_source_target_coerces_invalid_type,
@@ -204,8 +254,10 @@ def main(*, verbose: bool = True) -> int:
         test_router_uses_adapter_before_fetching_html,
         test_router_enriches_payloads_with_candidate_collections,
         test_router_uses_state_sniffer_before_browser,
+        test_router_synthesizes_json_payload_for_non_adapter_target,
         test_router_falls_back_to_browser_after_fetch_failure,
         test_router_falls_back_to_browser_when_state_cannot_be_synthesized,
+        test_static_processor_dedupes_urls_and_tracks_counters,
     ]
     for test in tests:
         test()

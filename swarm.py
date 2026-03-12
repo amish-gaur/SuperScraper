@@ -13,13 +13,30 @@ from agent import ResearchAgent
 from architect import DatasetArchitect, DatasetBlueprint, SourceTarget
 from browser import BrowserController
 from checkpoint import CheckpointManager
+from crawlee_fetcher import CrawleeStaticRequestProcessor
 from extraction_router import ExtractionRouter
 from llm import LLMGateway
-from source_health import REGISTRY
 from source_ranker import SourceRanker
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class StaticStageResult:
+    """Deterministic Crawlee stage output."""
+
+    records: list[BaseModel]
+    browser_targets: list[SourceTarget]
+
+
+@dataclass(slots=True)
+class BrowserStageResult:
+    """Browser fallback stage output."""
+
+    records: list[BaseModel]
+    attempted_urls: int = 0
+    failed_urls: int = 0
 
 
 @dataclass(slots=True)
@@ -56,67 +73,45 @@ class SwarmDispatcher:
             return deduped_records
 
         refreshed_once = False
+        static_processor = CrawleeStaticRequestProcessor()
+        router = ExtractionRouter(
+            goal=self.goal,
+            row_model=self.row_model,
+            llm_gateway=self.llm_gateway,
+            domain_blacklist=self.domain_blacklist,
+            static_processor=static_processor,
+        )
         while True:
-            direct_records, browser_targets = self._extract_routed_records(starting_targets)
-            if direct_records:
-                deduped_records.extend(direct_records)
+            static_result = await self._run_static_stage(
+                source_targets=starting_targets,
+                router=router,
+                processor=static_processor,
+            )
+            if static_result.records:
+                deduped_records.extend(static_result.records)
                 deduped_records = self._dedupe_records(deduped_records)
                 remaining_target = max(self.blueprint.target_record_count - len(deduped_records), 0)
                 LOGGER.info(
-                    "Intermediate routing produced %d records before browser automation",
-                    len(direct_records),
+                    "Static Crawlee stage produced %d records before browser fallback",
+                    len(static_result.records),
                 )
                 if self._goal_satisfied(deduped_records):
                     return deduped_records
 
-            if self.llm_gateway is not None and browser_targets:
-                per_agent_target = max(1, -(-remaining_target // max(self.agent_count, 1)))
-                browser_urls = [target.url for target in browser_targets]
-                for batch_start in range(0, len(browser_urls), self.agent_count):
-                    if len(deduped_records) >= self.blueprint.target_record_count:
-                        break
-
-                    batch_urls = [
-                        url for url in browser_urls[batch_start : batch_start + self.agent_count]
-                        if _root_domain(url) not in self.domain_blacklist
-                    ]
-                    if not batch_urls:
-                        continue
-                    agents = [
-                        ResearchAgent(
-                            name=f"agent-{batch_start + index + 1}",
-                            goal=self.goal,
-                            dataset_name=self.blueprint.dataset_name,
-                            row_model=self.row_model,
-                            starting_url=url,
-                            target_record_count=per_agent_target,
-                            browser=BrowserController(extra_args=("--session", f"swarm-{batch_start + index + 1}")),
-                            llm_gateway=self.llm_gateway,
-                            checkpoint_manager=self.checkpoint_manager,
-                            existing_records=deduped_records,
-                            domain_blacklist=self.domain_blacklist,
-                        )
-                        for index, url in enumerate(batch_urls)
-                    ]
-
-                    LOGGER.info("Launching %d parallel research agents across direct source URLs", len(agents))
-                    before_batch_count = len(deduped_records)
-                    results = await asyncio.gather(*(agent.run() for agent in agents), return_exceptions=True)
-
-                    for index, result in enumerate(results, start=batch_start + 1):
-                        if isinstance(result, Exception):
-                            LOGGER.warning("Agent %d failed: %s", index, result)
-                            continue
-                        deduped_records.extend(result)
-                        deduped_records = self._dedupe_records(deduped_records)
-                        remaining_target = max(self.blueprint.target_record_count - len(deduped_records), 0)
-
-                    if len(deduped_records) > before_batch_count:
-                        if self._goal_satisfied(deduped_records):
-                            return deduped_records
-                        break
+            browser_result = await self._run_browser_stage(
+                browser_targets=static_result.browser_targets,
+                existing_records=deduped_records,
+                remaining_target=remaining_target,
+            )
+            if browser_result.records:
+                deduped_records.extend(browser_result.records)
+                deduped_records = self._dedupe_records(deduped_records)
+                remaining_target = max(self.blueprint.target_record_count - len(deduped_records), 0)
+                if self._goal_satisfied(deduped_records):
+                    return deduped_records
             else:
-                LOGGER.info("No LLM gateway available; skipping browser agents after deterministic extraction")
+                if self.llm_gateway is None:
+                    LOGGER.info("No LLM gateway available; skipping browser fallback stage")
 
             if deduped_records or refreshed_once:
                 break
@@ -129,33 +124,134 @@ class SwarmDispatcher:
         LOGGER.info("Swarm aggregated %d raw records", len(deduped_records))
         return deduped_records
 
-    def _extract_routed_records(self, source_targets: list[SourceTarget]) -> tuple[list[BaseModel], list[SourceTarget]]:
-        """Route sources through adapters, state sniffing, and deterministic HTML before browser fallback."""
-        router = ExtractionRouter(
-            goal=self.goal,
-            row_model=self.row_model,
-            llm_gateway=self.llm_gateway,
-            domain_blacklist=self.domain_blacklist,
-        )
+    async def _run_static_stage(
+        self,
+        *,
+        source_targets: list[SourceTarget],
+        router: ExtractionRouter,
+        processor: CrawleeStaticRequestProcessor,
+    ) -> StaticStageResult:
+        """Route static sources through Crawlee before browser fallback."""
         records: list[BaseModel] = []
         browser_targets: list[SourceTarget] = []
+
+        static_targets: list[SourceTarget] = []
+        remaining_targets: list[SourceTarget] = []
         for source_target in source_targets:
-            url = source_target.url
-            if REGISTRY.should_cooldown(url):
-                self.domain_blacklist.add(_root_domain(url))
-                continue
-            decision = router.route(source_target)
-            if decision.records:
-                LOGGER.info(
-                    "Extraction router produced %d records at %s via %s",
-                    len(decision.records),
-                    url,
-                    decision.strategy,
+            adapter = router.select_adapter(source_target)
+            if router.should_route_with_crawlee(source_target, adapter=adapter):
+                static_targets.append(source_target)
+            else:
+                remaining_targets.append(source_target)
+
+        if static_targets:
+            fetched_targets = await asyncio.to_thread(
+                processor.fetch_sync,
+                static_targets,
+                adapters=router.adapters,
+            )
+            for fetched_target in fetched_targets:
+                decision = router.route_prefetched(
+                    fetched_target.source_target,
+                    fetched_target.fetch_result,
+                    adapter=fetched_target.adapter,
                 )
-                records.extend(decision.records)
-            elif decision.requires_browser:
-                browser_targets.append(source_target)
-        return records, browser_targets
+                if decision.records:
+                    LOGGER.info(
+                        "Extraction router produced %d records at %s via %s",
+                        len(decision.records),
+                        fetched_target.source_target.url,
+                        decision.strategy,
+                    )
+                    records.extend(decision.records)
+                elif decision.requires_browser:
+                    browser_targets.append(fetched_target.source_target)
+
+        browser_targets.extend(remaining_targets)
+        LOGGER.info(
+            (
+                "Static stage summary routed=%d browser_fallback=%d input=%d unique=%d "
+                "duplicates=%d successful=%d failed=%d failed_by_reason=%s artifacts=%d"
+            ),
+            len(records),
+            len(browser_targets),
+            processor.stats.input_urls,
+            processor.stats.unique_urls,
+            processor.stats.deduped_urls,
+            processor.stats.handled_urls,
+            processor.stats.failed_urls,
+            processor.stats.failed_urls_by_reason or {},
+            processor.stats.artifacts_written,
+        )
+        return StaticStageResult(records=records, browser_targets=browser_targets)
+
+    async def _run_browser_stage(
+        self,
+        *,
+        browser_targets: list[SourceTarget],
+        existing_records: list[BaseModel],
+        remaining_target: int,
+    ) -> BrowserStageResult:
+        """Run browser agents only for URLs that the static stage could not satisfy."""
+        if self.llm_gateway is None or not browser_targets:
+            return BrowserStageResult(records=[])
+
+        attempted_urls = 0
+        failed_urls = 0
+        collected_records: list[BaseModel] = []
+        per_agent_target = max(1, -(-remaining_target // max(self.agent_count, 1)))
+        browser_urls = [target.url for target in browser_targets]
+        LOGGER.info("Browser fallback stage starting for %d candidate URLs", len(browser_urls))
+        for batch_start in range(0, len(browser_urls), self.agent_count):
+            if len(existing_records) + len(collected_records) >= self.blueprint.target_record_count:
+                break
+
+            batch_urls = [
+                url for url in browser_urls[batch_start : batch_start + self.agent_count]
+                if _root_domain(url) not in self.domain_blacklist
+            ]
+            if not batch_urls:
+                continue
+            attempted_urls += len(batch_urls)
+            agents = [
+                ResearchAgent(
+                    name=f"agent-{batch_start + index + 1}",
+                    goal=self.goal,
+                    dataset_name=self.blueprint.dataset_name,
+                    row_model=self.row_model,
+                    starting_url=url,
+                    target_record_count=per_agent_target,
+                    browser=BrowserController(extra_args=("--session", f"swarm-{batch_start + index + 1}")),
+                    llm_gateway=self.llm_gateway,
+                    checkpoint_manager=self.checkpoint_manager,
+                    existing_records=existing_records + collected_records,
+                    domain_blacklist=self.domain_blacklist,
+                )
+                for index, url in enumerate(batch_urls)
+            ]
+
+            LOGGER.info("Launching %d browser agents", len(agents))
+            results = await asyncio.gather(*(agent.run() for agent in agents), return_exceptions=True)
+            for index, result in enumerate(results, start=batch_start + 1):
+                if isinstance(result, Exception):
+                    failed_urls += 1
+                    LOGGER.warning("Browser agent %d failed: %s", index, result)
+                    continue
+                collected_records.extend(result)
+            if collected_records:
+                break
+
+        LOGGER.info(
+            "Browser fallback stage summary attempted=%d failed=%d produced=%d",
+            attempted_urls,
+            failed_urls,
+            len(collected_records),
+        )
+        return BrowserStageResult(
+            records=collected_records,
+            attempted_urls=attempted_urls,
+            failed_urls=failed_urls,
+        )
 
     def _select_source_targets(self, source_targets: list[SourceTarget]) -> list[SourceTarget]:
         """Choose the direct source targets that seed deterministic extraction and browser agents."""
@@ -222,12 +318,10 @@ class SwarmDispatcher:
     def _is_blocked_domain(self, url: str) -> bool:
         blocked_domains = (
             "sports-reference.com",
-            "espn.com",
         )
         root_domain = _root_domain(url)
         return (
             root_domain in self.domain_blacklist
-            or REGISTRY.should_cooldown(url)
             or any(domain in url for domain in blocked_domains)
         )
 

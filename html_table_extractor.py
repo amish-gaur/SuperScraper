@@ -6,14 +6,15 @@ from dataclasses import dataclass
 from io import StringIO
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import pandas as pd
 from pydantic import BaseModel, ValidationError
 import urllib3
 
-from source_health import FailureReason, fetch_url, REGISTRY
+from crawlee_fetcher import CrawleeFetcher
+from source_health import FailureReason, REGISTRY
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ class HtmlTableExtractor:
     row_model: type[BaseModel]
     timeout_seconds: float = 20.0
     domain_blacklist: set[str] | None = None
+    html_fetcher: Callable[[str], Any] | None = None
+    crawlee_fetcher: CrawleeFetcher | None = None
 
     def extract(self, url: str) -> list[BaseModel]:
         """Fetch a page and parse any tables that map cleanly to the row schema."""
@@ -80,18 +83,14 @@ class HtmlTableExtractor:
         return records
 
     def _fetch_html(self, url: str):
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; WebScraperPrototype/1.0; "
-                "+https://example.com/web-scraper)"
+        if self.html_fetcher is not None:
+            outcome = self.html_fetcher(url)
+        else:
+            fetcher = self.crawlee_fetcher or CrawleeFetcher(timeout_seconds=self.timeout_seconds)
+            outcome = fetcher.fetch_html(
+                url,
+                expected_source_type="html_table",
             )
-        }
-        outcome = fetch_url(
-            url,
-            headers=headers,
-            timeout_seconds=self.timeout_seconds,
-            verify=False,
-        )
         if outcome.reason in {FailureReason.HTTP_403, FailureReason.HTTP_429, FailureReason.ANTI_BOT}:
             self._blacklist_domain(url)
         if not outcome.ok:

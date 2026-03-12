@@ -44,6 +44,7 @@ class AppSettings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     artifact_root: Path = Field(default=Path("artifacts"))
     max_agents_default: int = 2
+    frontend_origin: str | None = None
 
     openai_api_key: str | None = None
     gemini_api_key: str | None = None
@@ -106,6 +107,18 @@ class AppSettings(BaseSettings):
             raise ValueError(
                 "AGENT_BROWSER_BIN is not installed or not on PATH. Install agent-browser before starting the API or worker."
             )
+
+    @property
+    def cors_origins(self) -> list[str]:
+        origins = [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
+        if self.frontend_origin and self.frontend_origin.strip():
+            origins.append(self.frontend_origin.strip().rstrip("/"))
+        return list(dict.fromkeys(origins))
 
 
 @lru_cache(maxsize=1)

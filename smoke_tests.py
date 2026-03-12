@@ -258,6 +258,30 @@ def test_prepare_frame_drops_repeated_header_rows() -> None:
     assert "Denver" in prepared["raw_entity_name"].tolist()
 
 
+def test_prepare_frame_coalesces_duplicate_entities_with_partial_values() -> None:
+    builder = PredictiveDatasetBuilder(
+        goal="nba team stats",
+        dataset_name="x",
+        starting_urls=[],
+        minimum_rows=2,
+    )
+    frame = pd.DataFrame(
+        {
+            "team": ["Denver", "Denver", "Boston"],
+            "wins": ["57", None, "64"],
+            "pace": [None, "98.1", "99.2"],
+            "_source_url": ["a", "b", "a"],
+        }
+    )
+    prepared = builder._prepare_frame(frame)
+    assert prepared is not None
+    assert len(prepared) == 2, prepared
+    denver = prepared.loc[prepared["entity_name"] == "denver"]
+    assert denver["wins"].iloc[0] == 57
+    assert denver["pace"].iloc[0] == 98.1
+    assert denver["source_url"].iloc[0] == "a | b"
+
+
 def test_merge_frames_coalesces_overlapping_columns() -> None:
     builder = PredictiveDatasetBuilder(
         goal="nba team stats",
@@ -286,6 +310,32 @@ def test_merge_frames_coalesces_overlapping_columns() -> None:
     assert "off_rating" in merged.columns
     assert merged.loc[merged["entity_name"] == "boston celtics", "wins"].iloc[0] == 64
     assert merged.loc[merged["entity_name"] == "denver nuggets", "wins"].iloc[0] == 57
+
+
+def test_merge_frames_preserves_combined_source_urls() -> None:
+    builder = PredictiveDatasetBuilder(
+        goal="nba team stats",
+        dataset_name="x",
+        starting_urls=[],
+        minimum_rows=2,
+    )
+    left = pd.DataFrame(
+        {
+            "entity_name": ["denver nuggets"],
+            "raw_entity_name": ["Denver Nuggets"],
+            "wins": [57],
+            "source_url": ["https://example.com/wins"],
+        }
+    )
+    right = pd.DataFrame(
+        {
+            "entity_name": ["denver nuggets"],
+            "off_rating": [119.5],
+            "source_url": ["https://example.com/off-rating"],
+        }
+    )
+    merged = builder._merge_frames(left, right, how="left")
+    assert merged["source_url"].iloc[0] == "https://example.com/wins | https://example.com/off-rating"
 
 
 def test_concat_frames_preserves_union_of_columns_and_rows() -> None:
@@ -337,6 +387,64 @@ def test_finalize_frame_cleans_column_labels_and_ordering() -> None:
     assert list(finalized.columns) == ["name", "entity_name", "salary", "points_per_game", "source"], finalized.columns
 
 
+def test_finalize_frame_adds_schema_aliases_for_state_goal() -> None:
+    builder = PredictiveDatasetBuilder(
+        goal="Build a predictive dataset of U.S. states with population growth as the target and economic features",
+        dataset_name="x",
+        starting_urls=[],
+        minimum_rows=2,
+        minimum_columns=5,
+        target_field="population_growth_rate",
+        core_feature_fields=["state", "population", "gdp", "gdp_growth_rate"],
+    )
+    frame = pd.DataFrame(
+        {
+            "entity_name": ["texas", "florida"],
+            "raw_entity_name": ["Texas", "Florida"],
+            "2010_2020_change": [15.9, 14.6],
+            "census_population_8_9_a_july_1_2025_est": [31709821, 23932841],
+            "nominal_gdp_at_current_prices_2024_millions_of_u_s_dollars_1_2024": [2709393, 1649876],
+            "real_gdp_growth_rate_2023_2024_1_real_gdp_growth_rate_2023_2024_1": [7.7, 3.2],
+            "source_url": ["https://example.com/states", "https://example.com/states"],
+        }
+    )
+    finalized = builder._finalize_frame(frame)
+    assert "state" in finalized.columns, finalized.columns
+    assert "population_growth_rate" in finalized.columns, finalized.columns
+    assert "population" in finalized.columns, finalized.columns
+    assert "gdp" in finalized.columns, finalized.columns
+    assert "gdp_growth_rate" in finalized.columns, finalized.columns
+    assert finalized.loc[0, "state"] == "Texas"
+    assert finalized.loc[0, "population_growth_rate"] == 15.9
+
+
+def test_prepare_frame_preserves_rank_when_schema_requires_it() -> None:
+    builder = PredictiveDatasetBuilder(
+        goal="Build a predictive dataset of Fortune 500 companies",
+        dataset_name="x",
+        starting_urls=[],
+        minimum_rows=2,
+        target_field="revenue_usd_millions",
+        core_feature_fields=["company_name", "rank", "revenue_growth", "employees", "headquarters"],
+    )
+    frame = pd.DataFrame(
+        {
+            "rank": [1, 2],
+            "name": ["Walmart", "Amazon"],
+            "revenue": [680985, 637959],
+            "revenue_growth": [5.1, 11.0],
+            "employees": [2100000, 1556000],
+            "_source_url": ["https://example.com/fortune", "https://example.com/fortune"],
+        }
+    )
+    prepared = builder._prepare_frame(frame)
+    assert prepared is not None
+    assert "rank" in prepared.columns, prepared.columns
+    finalized = builder._finalize_frame(prepared)
+    assert "company_name" in finalized.columns, finalized.columns
+    assert "rank" in finalized.columns, finalized.columns
+
+
 def test_finalize_frame_trims_excess_width_using_signal() -> None:
     builder = PredictiveDatasetBuilder(
         goal="Build a predictive dataset of NBA teams with playoff outcome target",
@@ -372,6 +480,27 @@ def test_finalize_frame_trims_excess_width_using_signal() -> None:
     assert "source" not in finalized.columns
 
 
+def test_finalize_frame_drops_duplicate_value_columns() -> None:
+    builder = PredictiveDatasetBuilder(
+        goal="Build a predictive dataset of NBA players with salary as the target and performance features",
+        dataset_name="x",
+        starting_urls=[],
+        minimum_rows=2,
+        minimum_columns=4,
+    )
+    frame = pd.DataFrame(
+        {
+            "entity_name": ["nikola jokic", "jayson tatum"],
+            "raw_entity_name": ["Nikola Jokic", "Jayson Tatum"],
+            "salary_salary": [51400000, 34800000],
+            "salary": [51400000, 34800000],
+            "points_per_game_value": [29.6, 27.1],
+        }
+    )
+    finalized = builder._finalize_frame(frame)
+    assert list(finalized.columns).count("salary") == 1, finalized.columns
+
+
 def test_goal_aware_row_count_prefers_expected_table_size() -> None:
     builder = PredictiveDatasetBuilder(
         goal="Build a predictive dataset of NBA teams with playoff outcome target",
@@ -397,6 +526,60 @@ def test_goal_aware_row_count_prefers_expected_table_size() -> None:
     assert builder._row_count_score(len(near_expected)) > builder._row_count_score(len(too_large))
     assert builder._frame_row_count_is_reasonable(near_expected) is True
     assert builder._frame_row_count_is_reasonable(too_large) is False
+
+
+def test_discover_ncaa_team_stat_urls_uses_filtered_option_values() -> None:
+    class DiscoveryBuilder(PredictiveDatasetBuilder):
+        def _fetch_html(self, url: str) -> str:
+            return """
+            <select>
+              <option value='/stats/basketball-men/d1/current/team/145'>Scoring Offense</option>
+              <option value="/stats/basketball-men/d1/current/team/932">Rebounds</option>
+              <option value="/stats/basketball-men/d1/current/team/999">Ignore</option>
+            </select>
+            """
+
+    builder = DiscoveryBuilder(goal="ncaa basketball team statistics", dataset_name="x", starting_urls=[], minimum_rows=2)
+    urls = builder._discover_ncaa_team_stat_urls("https://www.ncaa.com/stats/basketball-men/d1/current/team/145")
+    assert urls == [
+        "https://www.ncaa.com/stats/basketball-men/d1/current/team/145",
+        "https://www.ncaa.com/stats/basketball-men/d1/current/team/932",
+    ]
+
+
+def test_extract_transfermarkt_club_summary_uses_shared_fetch_path() -> None:
+    class TransfermarktBuilder(PredictiveDatasetBuilder):
+        def _fetch_html(self, url: str) -> str:
+            return """
+            <html><body>
+              <a href="#to-1"><img title="Arsenal"/></a>
+              <table><tr><th>placeholder</th></tr><tr><td>x</td></tr></table>
+              <table>
+                <tr><th>Player</th><th>Fee</th><th>Market value</th></tr>
+                <tr><td>A</td><td>EUR 10m</td><td>EUR 12m</td></tr>
+              </table>
+              <table>
+                <tr><th>Player</th><th>Fee</th><th>Market value</th></tr>
+                <tr><td>B</td><td>EUR 7m</td><td>EUR 8m</td></tr>
+              </table>
+            </body></html>
+            """
+
+    builder = TransfermarktBuilder(
+        goal="Build a predictive dataset of soccer clubs with transfer spend target",
+        dataset_name="x",
+        starting_urls=[],
+        minimum_rows=1,
+    )
+    frames = builder._extract_transfermarkt_club_summary(
+        "https://www.transfermarkt.com/premier-league/transfers/wettbewerb/GB1/plus/?saison_id=2025"
+    )
+    assert len(frames) == 1
+    frame = frames[0]
+    assert len(frame) == 1
+    assert frame["club"].iloc[0] == "Arsenal"
+    assert frame["incoming_transfer_spend"].iloc[0] == 10_000_000.0
+    assert frame["outgoing_transfer_income"].iloc[0] == 7_000_000.0
 
 
 def test_historical_nba_team_goal_skips_exact_row_cardinality() -> None:
@@ -582,11 +765,18 @@ def main() -> int:
         test_html_table_extractor_derives_laptop_specs_from_name_blob,
         test_deterministic_synthesizer_coalesces_partial_rows,
         test_prepare_frame_drops_repeated_header_rows,
+        test_prepare_frame_coalesces_duplicate_entities_with_partial_values,
         test_merge_frames_coalesces_overlapping_columns,
+        test_merge_frames_preserves_combined_source_urls,
         test_concat_frames_preserves_union_of_columns_and_rows,
         test_finalize_frame_cleans_column_labels_and_ordering,
+        test_finalize_frame_adds_schema_aliases_for_state_goal,
+        test_prepare_frame_preserves_rank_when_schema_requires_it,
         test_finalize_frame_trims_excess_width_using_signal,
+        test_finalize_frame_drops_duplicate_value_columns,
         test_goal_aware_row_count_prefers_expected_table_size,
+        test_discover_ncaa_team_stat_urls_uses_filtered_option_values,
+        test_extract_transfermarkt_club_summary_uses_shared_fetch_path,
         test_historical_nba_team_goal_skips_exact_row_cardinality,
         test_nba_predictive_builder,
         test_nba_player_predictive_builder,
