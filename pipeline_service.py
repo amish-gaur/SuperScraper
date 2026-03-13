@@ -16,10 +16,13 @@ from architect import (
 )
 from checkpoint import CheckpointManager
 from data_validation import DataValidationError, SemanticDataValidator
+from demo_datasets import demo_dataset_for_goal
 from formatter import MLFormatter
 from goal_intent import infer_goal_cardinality
 from llm import LLMGateway
+from post_extraction_pruner import PostExtractionPruner
 from predictive_dataset_builder import DataQualityError, PredictiveDatasetBuilder
+from settings import get_settings
 from source_memory import SourceMemory
 from synthesizer import DataSynthesizer
 from swarm import SwarmDispatcher
@@ -51,6 +54,7 @@ def run_pipeline(
 ) -> PipelineArtifacts:
     """Run the four-stage pipeline and return exported artifact metadata."""
     domain_blacklist: set[str] = set()
+    settings = get_settings()
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     checkpoint_manager = CheckpointManager(
@@ -71,6 +75,21 @@ def run_pipeline(
         model_name=blueprint.row_schema.title,
     )
     validator = SemanticDataValidator(row_model=row_model)
+    post_extraction_pruner = PostExtractionPruner(
+        goal=goal,
+        target_field=blueprint.row_schema.target_field,
+        core_feature_fields=[
+            field.name
+            for field in blueprint.row_schema.fields
+            if field.ml_role == "feature"
+        ],
+        required_feature_fields=[
+            field.name
+            for field in blueprint.row_schema.fields
+            if field.ml_role == "feature" and not field.nullable
+        ],
+        llm_gateway=llm_gateway,
+    )
 
     predictive_builder = PredictiveDatasetBuilder(
         goal=goal,
@@ -82,7 +101,14 @@ def run_pipeline(
             for field in blueprint.row_schema.fields
             if field.ml_role == "feature"
         ],
+        required_feature_fields=[
+            field.name
+            for field in blueprint.row_schema.fields
+            if field.ml_role == "feature" and not field.nullable
+        ],
         domain_blacklist=domain_blacklist,
+        llm_gateway=llm_gateway,
+        post_extraction_pruner=post_extraction_pruner,
         progress_callback=lambda message, detail: _notify(
             progress_callback,
             stage="predictive_builder",
@@ -140,6 +166,7 @@ def run_pipeline(
                 profile_path = formatter.export_profile(
                     goal=goal,
                     provenance_map=predictive_result.provenance_map,
+                    pruning_audit=predictive_result.pruning_audit,
                     llm_gateway=llm_gateway,
                     output_dir=output_dir_path,
                 )
@@ -154,6 +181,52 @@ def run_pipeline(
                     rows=len(validation_result.dataframe),
                     columns=len(validation_result.dataframe.columns),
                 )
+
+    demo_dataset = None
+    if settings.app_env == "production":
+        demo_dataset = demo_dataset_for_goal(goal)
+    if demo_dataset is not None:
+        LOGGER.warning(
+            "Falling back to deterministic demo dataset for hosted environment: %s",
+            demo_dataset.source_label,
+        )
+        _notify(
+            progress_callback,
+            stage="formatter",
+            message="Using hosted demo fallback dataset",
+            detail={"source": demo_dataset.source_label},
+        )
+        formatter = MLFormatter(demo_dataset.records, blueprint.dataset_name)
+        _notify(
+            progress_callback,
+            stage="validation",
+            message="Validating demo fallback dataset",
+            detail={"candidate_rows": len(formatter.dataframe)},
+        )
+        validation_result = validator.validate(
+            formatter.dataframe,
+            dataset_name=blueprint.dataset_name,
+        )
+        formatter.dataframe = validation_result.dataframe
+        formatter.handle_missing_values()
+        csv_path, parquet_path = formatter.export(output_dir=output_dir_path)
+        profile_path = formatter.export_profile(
+            goal=goal,
+            provenance_map=demo_dataset.provenance_map,
+            pruning_audit={"mode": "demo_fallback"},
+            llm_gateway=llm_gateway,
+            output_dir=output_dir_path,
+        )
+        validation_path = validation_result.report.write(output_dir=output_dir_path)
+        return PipelineArtifacts(
+            dataset_name=blueprint.dataset_name,
+            csv_path=str(csv_path.resolve()),
+            parquet_path=str(parquet_path.resolve()),
+            profile_path=str(profile_path.resolve()),
+            validation_path=str(validation_path.resolve()),
+            rows=len(validation_result.dataframe),
+            columns=len(validation_result.dataframe.columns),
+        )
 
     scrape_row_model = relax_pydantic_model(
         row_model,
@@ -200,11 +273,17 @@ def run_pipeline(
 
     _notify(
         progress_callback,
-        stage="formatter",
-        message="Formatting ML-ready dataset",
+        stage="post_processing",
+        message="Pruning synthesized dataset",
         detail={"clean_records": len(clean_records)},
     )
+    fallback_provenance = _fallback_provenance_map(clean_records)
     formatter = MLFormatter(clean_records, blueprint.dataset_name)
+    pruning_result = post_extraction_pruner.process(
+        formatter.dataframe,
+        provenance_map=fallback_provenance,
+    )
+    formatter.dataframe = pruning_result.dataframe
     try:
         predictive_builder._enforce_fill_rate(formatter.dataframe)
     except DataQualityError as exc:
@@ -215,7 +294,7 @@ def run_pipeline(
         progress_callback,
         stage="validation",
         message="Validating dataset semantics",
-        detail={"candidate_rows": len(clean_records)},
+        detail={"candidate_rows": len(formatter.dataframe)},
     )
     try:
         validation_result = validator.validate(
@@ -230,7 +309,8 @@ def run_pipeline(
     csv_path, parquet_path = formatter.export(output_dir=output_dir_path)
     profile_path = formatter.export_profile(
         goal=goal,
-        provenance_map=_fallback_provenance_map(clean_records),
+        provenance_map=pruning_result.provenance_map,
+        pruning_audit=pruning_result.pruning_audit,
         llm_gateway=llm_gateway,
         output_dir=output_dir_path,
     )
