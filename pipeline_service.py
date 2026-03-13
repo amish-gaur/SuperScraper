@@ -182,9 +182,7 @@ def run_pipeline(
                     columns=len(validation_result.dataframe.columns),
                 )
 
-    demo_dataset = None
-    if settings.app_env == "production":
-        demo_dataset = demo_dataset_for_goal(goal)
+    demo_dataset = demo_dataset_for_goal(goal)
     if demo_dataset is not None:
         LOGGER.warning(
             "Falling back to deterministic demo dataset for hosted environment: %s",
