@@ -101,7 +101,6 @@ def run_pipeline(
         profile_path = formatter.export_profile(
             goal=goal,
             provenance_map=demo_dataset.provenance_map,
-            pruning_audit={"mode": "demo_fallback"},
             llm_gateway=llm_gateway,
             output_dir=output_dir_path,
         )
@@ -190,7 +189,6 @@ def run_pipeline(
                 profile_path = formatter.export_profile(
                     goal=goal,
                     provenance_map=predictive_result.provenance_map,
-                    pruning_audit=predictive_result.pruning_audit,
                     llm_gateway=llm_gateway,
                     output_dir=output_dir_path,
                 )
