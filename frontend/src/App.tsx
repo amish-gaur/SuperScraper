@@ -77,6 +77,7 @@ const CONFIGURED_API_BASE =
 const DEFAULT_API_BASE =
   CONFIGURED_API_BASE.trim() ||
   (typeof window !== "undefined" ? window.location.origin : "http://localhost:8000");
+const IS_PRODUCTION_FRONTEND = CONFIGURED_API_BASE.trim().length > 0;
 
 function App() {
   const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
@@ -244,6 +245,13 @@ function App() {
 
   return (
     <div className="app-shell">
+      <aside className="onboarding-strip">
+        <strong>Try the guaranteed demos first.</strong>
+        <span>
+          NBA salary, NCAA team stats, and U.S. states all complete reliably on the hosted app and
+          show the full artifact flow.
+        </span>
+      </aside>
       <header className="hero">
         <div className="hero-copy">
           <p className="eyebrow">Web Scraper</p>
@@ -304,7 +312,7 @@ function App() {
               </span>
             </div>
 
-            <div className="split-fields">
+            <div className={`split-fields${IS_PRODUCTION_FRONTEND ? " split-fields-single" : ""}`}>
               <label className="field">
                 <span>Max Agents</span>
                 <input
@@ -316,14 +324,16 @@ function App() {
                 />
               </label>
 
-              <label className="field">
-                <span>API Base URL</span>
-                <input
-                  value={apiBase}
-                  onChange={(event) => setApiBase(event.target.value)}
-                  placeholder={DEFAULT_API_BASE}
-                />
-              </label>
+              {!IS_PRODUCTION_FRONTEND ? (
+                <label className="field">
+                  <span>API Base URL</span>
+                  <input
+                    value={apiBase}
+                    onChange={(event) => setApiBase(event.target.value)}
+                    placeholder={DEFAULT_API_BASE}
+                  />
+                </label>
+              ) : null}
             </div>
 
             <div className="actions">
