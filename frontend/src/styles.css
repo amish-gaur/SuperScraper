@@ -186,6 +186,48 @@ a {
   resize: vertical;
 }
 
+.demo-callout,
+.selected-example {
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.demo-callout {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  display: grid;
+  gap: 4px;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.demo-callout strong,
+.selected-example-label,
+.example-chip strong {
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.selected-example {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.selected-example-guarantee,
+.example-chip em {
+  font-style: normal;
+  color: #9ae6b4;
+  font-size: 0.82rem;
+}
+
+.selected-example-freeform .selected-example-guarantee {
+  color: #fde68a;
+}
+
 .split-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -238,6 +280,13 @@ a {
   color: rgba(255, 255, 255, 0.88);
   text-align: left;
   cursor: pointer;
+  display: grid;
+  gap: 6px;
+}
+
+.example-chip span {
+  color: rgba(255, 255, 255, 0.72);
+  line-height: 1.45;
 }
 
 .badge {
@@ -269,6 +318,11 @@ a {
   background: #fca5a5;
 }
 
+.badge-partial_success {
+  color: #0a0a0a;
+  background: #fcd34d;
+}
+
 .status-message,
 .empty-state,
 .detail-box p,
@@ -280,6 +334,35 @@ a {
 .detail-box {
   padding: 14px 16px;
   margin: 14px 0 16px;
+}
+
+.status-callout {
+  margin: 14px 0 16px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid transparent;
+}
+
+.status-callout p {
+  margin: 0;
+}
+
+.status-callout-error {
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.28);
+  border-color: rgba(252, 165, 165, 0.3);
+}
+
+.status-callout-warning {
+  color: #fde68a;
+  background: rgba(120, 53, 15, 0.28);
+  border-color: rgba(252, 211, 77, 0.3);
+}
+
+.status-callout-success {
+  color: #bbf7d0;
+  background: rgba(20, 83, 45, 0.28);
+  border-color: rgba(110, 231, 183, 0.28);
 }
 
 .detail-box p {
@@ -411,6 +494,11 @@ a {
   overflow: auto;
 }
 
+.preview-summary {
+  margin-top: 0;
+  color: rgba(255, 255, 255, 0.66);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -463,5 +551,10 @@ th {
   .app-shell {
     width: min(100% - 20px, 1280px);
     padding-top: 16px;
+  }
+
+  .selected-example {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }

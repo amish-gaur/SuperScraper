@@ -1,6 +1,6 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-type JobStatus = "queued" | "running" | "completed" | "failed";
+type JobStatus = "queued" | "running" | "completed" | "failed" | "partial_success";
 
 type JobPayload = {
   job_id: string;
@@ -42,10 +42,22 @@ type JobLogPayload = {
 };
 
 const EXAMPLE_GOALS = [
-  "Build a predictive dataset of NBA players with salary as the target and performance features",
-  "Build a predictive dataset of NCAA men's basketball team statistics",
-  "Build a predictive dataset of U.S. states with population growth as the target and GDP features",
-];
+  {
+    label: "NBA salary demo",
+    goal: "Build a predictive dataset of NBA players with salary as the target and performance features",
+    guarantee: "Guaranteed hosted demo",
+  },
+  {
+    label: "NCAA team stats demo",
+    goal: "Build a predictive dataset of NCAA men's basketball team statistics",
+    guarantee: "Guaranteed hosted demo",
+  },
+  {
+    label: "U.S. states demo",
+    goal: "Build a predictive dataset of U.S. states with population growth as the target and GDP features",
+    guarantee: "Guaranteed hosted demo",
+  },
+] as const;
 
 const STAGES = [
   { id: "queued", label: "Queued" },
@@ -56,6 +68,7 @@ const STAGES = [
   { id: "formatter", label: "Dataset Packaging" },
   { id: "completed", label: "Ready" },
 ];
+const TERMINAL_STATUSES: JobStatus[] = ["completed", "failed", "partial_success"];
 
 const CONFIGURED_API_BASE =
   typeof import.meta !== "undefined" && import.meta.env.VITE_API_BASE_URL
@@ -67,7 +80,7 @@ const DEFAULT_API_BASE =
 
 function App() {
   const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
-  const [goal, setGoal] = useState(EXAMPLE_GOALS[0]);
+  const [goal, setGoal] = useState<string>(EXAMPLE_GOALS[0].goal);
   const [maxAgents, setMaxAgents] = useState(2);
   const [job, setJob] = useState<JobPayload | null>(null);
   const [profile, setProfile] = useState<ProfilePayload | null>(null);
@@ -77,9 +90,10 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  const terminalRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (!job || job.status === "completed" || job.status === "failed") {
+    if (!job || isTerminalJobStatus(job.status)) {
       return undefined;
     }
 
@@ -118,6 +132,9 @@ function App() {
     };
 
     void loadLogs();
+    if (isTerminalJobStatus(job.status)) {
+      return undefined;
+    }
     const intervalId = window.setInterval(() => {
       void loadLogs();
     }, 2000);
@@ -127,6 +144,14 @@ function App() {
       window.clearInterval(intervalId);
     };
   }, [apiBase, job]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
+    terminal.scrollTop = terminal.scrollHeight;
+  }, [logs]);
 
   useEffect(() => {
     if (job?.status !== "completed") {
@@ -170,11 +195,17 @@ function App() {
     if (index >= 0) {
       return index;
     }
-    if (job?.status === "failed") {
+    if (job?.status === "failed" || job?.status === "partial_success") {
       return 0;
     }
     return 0;
   }, [job]);
+  const jobNotice = getJobNotice(job);
+  const selectedExample = EXAMPLE_GOALS.find((example) => example.goal === goal);
+  const previewSummary =
+    preview && preview.rows.length > 0
+      ? `Showing ${preview.rows.length} sample rows from the finished dataset`
+      : "A sample preview will appear here when the run completes.";
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -218,8 +249,9 @@ function App() {
           <p className="eyebrow">Web Scraper</p>
           <h1>Build a dataset, watch the pipeline, inspect the output.</h1>
           <p className="lede">
-            A local control room for the dataset-generation pipeline. Submit one goal, watch the
-            live job log, and review the finished artifacts without leaving the page.
+            A hosted control room for the dataset-generation pipeline. Use one of the guaranteed
+            demo goals below for the cleanest end-to-end walkthrough with logs, preview rows, and
+            artifact downloads.
           </p>
         </div>
         <div className="hero-card">
@@ -242,7 +274,14 @@ function App() {
         <section className="panel composer">
           <div className="panel-header">
             <h2>Start A Run</h2>
-            <span className="badge badge-neutral">Local</span>
+            <span className="badge badge-neutral">Hosted Demo</span>
+          </div>
+          <div className="demo-callout">
+            <strong>Best path:</strong>
+            <span>
+              Start with one of the three example goals. Those are wired to deterministic hosted
+              demo datasets and should complete reliably on the deployed site.
+            </span>
           </div>
           <form onSubmit={handleSubmit}>
             <label className="field">
@@ -254,6 +293,16 @@ function App() {
                 placeholder="Describe the dataset you want to build"
               />
             </label>
+            <div
+              className={`selected-example${selectedExample ? "" : " selected-example-freeform"}`}
+            >
+              <span className="selected-example-label">
+                {selectedExample ? selectedExample.label : "Custom goal"}
+              </span>
+              <span className="selected-example-guarantee">
+                {selectedExample ? selectedExample.guarantee : "Best-effort live scraping"}
+              </span>
+            </div>
 
             <div className="split-fields">
               <label className="field">
@@ -289,12 +338,14 @@ function App() {
             <div className="example-list">
               {EXAMPLE_GOALS.map((example) => (
                 <button
-                  key={example}
+                  key={example.goal}
                   className="example-chip"
                   type="button"
-                  onClick={() => setGoal(example)}
+                  onClick={() => setGoal(example.goal)}
                 >
-                  {example}
+                  <strong>{example.label}</strong>
+                  <span>{example.goal}</span>
+                  <em>{example.guarantee}</em>
                 </button>
               ))}
             </div>
@@ -311,6 +362,11 @@ function App() {
             {job ? (
               <>
                 <p className="status-message">{job.progress?.message ?? "Waiting for updates"}</p>
+                {jobNotice ? (
+                  <div className={`status-callout status-callout-${jobNotice.tone}`}>
+                    <p>{jobNotice.message}</p>
+                  </div>
+                ) : null}
                 {job.progress?.detail && Object.keys(job.progress.detail).length > 0 ? (
                   <div className="detail-box">
                     {Object.entries(job.progress.detail).map(([key, value]) => (
@@ -366,7 +422,7 @@ function App() {
               <span className="badge badge-neutral">{logs.length} lines</span>
             </div>
             {job ? (
-              <div className="terminal">
+              <div className="terminal" ref={terminalRef}>
                 {logs.length > 0 ? (
                   logs.map((line, index) => <div key={`${index}-${line}`}>{line}</div>)
                 ) : (
@@ -453,6 +509,7 @@ function App() {
 
               <article className="result-card preview">
                 <h3>Preview Rows</h3>
+                <p className="preview-summary">{previewSummary}</p>
                 {preview ? (
                   <div className="table-wrap">
                     <table>
@@ -481,7 +538,11 @@ function App() {
             </>
           ) : (
             <p className="empty-state">
-              Completed runs will show profile metadata, a row preview, and artifact downloads here.
+              {job?.status === "failed"
+                ? "This run stopped before export because required sources blocked automated extraction."
+                : job?.status === "partial_success"
+                  ? "This run gathered some rows but stopped early after repeated source blocking, so export artifacts were not produced."
+                  : "Completed runs will show profile metadata, a row preview, and artifact downloads here."}
             </p>
           )}
         </section>
@@ -494,6 +555,10 @@ function App() {
 
 function normalizedApiBase(value: string) {
   return value.trim().replace(/\/+$/, "");
+}
+
+function isTerminalJobStatus(status: JobStatus) {
+  return TERMINAL_STATUSES.includes(status);
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -519,6 +584,50 @@ function getErrorMessage(error: unknown) {
     return error.message;
   }
   return "Unexpected error";
+}
+
+function getJobNotice(job: JobPayload | null) {
+  if (!job) {
+    return null;
+  }
+  if (job.status === "completed") {
+    return {
+      tone: "success" as const,
+      message: "Run completed. The dataset profile, preview rows, and downloads are ready.",
+    };
+  }
+  const failureKind =
+    job.progress?.detail && "failure_kind" in job.progress.detail
+      ? String(job.progress.detail.failure_kind)
+      : null;
+  if (job.status === "failed" && failureKind === "source_rejection") {
+    return {
+      tone: "error" as const,
+      message:
+        "Required data sources actively blocked this automated extraction attempt. The run was stopped early so the UI would not stay stuck in a running state.",
+    };
+  }
+  if (job.status === "partial_success" && failureKind === "source_rejection") {
+    const partialRows =
+      job.progress?.detail && "partial_records" in job.progress.detail
+        ? Number(job.progress.detail.partial_records)
+        : null;
+    return {
+      tone: "warning" as const,
+      message:
+        partialRows && Number.isFinite(partialRows)
+          ? `Required data sources blocked the run after ${partialRows} partial rows were gathered. The swarm stopped early instead of looping indefinitely.`
+          : "Required data sources blocked the run after some partial data was gathered. The swarm stopped early instead of looping indefinitely.",
+    };
+  }
+  if (job.progress?.stage === "swarm") {
+    return {
+      tone: "warning" as const,
+      message:
+        "This run fell back to broader scraping. The guaranteed demo goals should avoid this path, but custom goals may take longer or stop early.",
+    };
+  }
+  return null;
 }
 
 function formatCell(value: unknown) {
