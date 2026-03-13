@@ -68,6 +68,7 @@ class MLFormatter:
         *,
         goal: str,
         provenance_map: dict[str, str] | None = None,
+        pruning_audit: dict[str, Any] | None = None,
         llm_gateway: LLMGateway | None = None,
         output_dir: str | Path = ".",
     ) -> Path:
@@ -78,6 +79,7 @@ class MLFormatter:
             self.dataset_name,
             goal=goal,
             provenance_map=provenance_map,
+            pruning_audit=pruning_audit,
             llm_gateway=llm_gateway,
         )
         path = profiler.write(profile, output_dir=output_dir)

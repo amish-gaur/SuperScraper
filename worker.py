@@ -13,6 +13,7 @@ from llm import LLMError, LLMGateway
 from pipeline_service import run_pipeline
 from settings import get_settings
 from tracing import configure_llm_tracing
+from swarm import SwarmAbortError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -49,6 +50,17 @@ def run_scrape_job(self, *, job_id: str, goal: str, max_agents: int) -> dict[str
             checkpoint_path=store.job_dir(job_id) / "pipeline_cache.json",
             progress_callback=on_progress,
         )
+    except SwarmAbortError as exc:
+        if exc.partial_records > 0:
+            store.mark_partial_success(
+                job_id,
+                message=str(exc),
+                detail=exc.detail,
+            )
+        else:
+            store.mark_failure(job_id, error=str(exc))
+        LOGGER.exception("Job %s aborted by fail-fast protection", job_id)
+        raise
     except (LLMError, ValueError, RuntimeError) as exc:
         store.mark_failure(job_id, error=str(exc))
         LOGGER.exception("Job %s failed", job_id)
@@ -63,6 +75,7 @@ def run_scrape_job(self, *, job_id: str, goal: str, max_agents: int) -> dict[str
         "csv_path": artifacts.csv_path,
         "parquet_path": artifacts.parquet_path,
         "profile_path": artifacts.profile_path,
+        "validation_path": artifacts.validation_path,
         "rows": artifacts.rows,
         "columns": artifacts.columns,
     }

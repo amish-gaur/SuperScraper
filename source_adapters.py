@@ -95,7 +95,6 @@ def _ncaa_basketball_urls(goal: str) -> list[str]:
         f"https://www.sports-reference.com/cbb/seasons/{year}-opponent-stats.html",
         "https://en.wikipedia.org/wiki/List_of_NCAA_Division_I_men%27s_basketball_programs",
         "https://www.teamrankings.com/ncb/stats/",
-        "https://www.statbunker.com/",
     ]
 
 

@@ -43,9 +43,11 @@ class AppSettings(BaseSettings):
 
     app_env: Literal["development", "production", "test"] = "development"
     redis_url: str = "redis://redis:6379/0"
+    enable_background_jobs: bool = False
     artifact_root: Path = Field(default=Path("artifacts"))
     max_agents_default: int = 2
     frontend_origin: str | None = None
+    allow_vercel_preview_origins: bool = False
 
     openai_api_key: str | None = None
     gemini_api_key: str | None = None
@@ -95,8 +97,6 @@ class AppSettings(BaseSettings):
         )
 
     def validate_for_service(self) -> None:
-        if not self.redis_url.strip():
-            raise ValueError("REDIS_URL must be configured.")
         if not self.has_llm_api_key:
             logging.getLogger(__name__).warning(
                 "No LLM API key configured. Service will still start, but LLM-backed jobs may fail."
@@ -121,6 +121,16 @@ class AppSettings(BaseSettings):
         if self.frontend_origin and self.frontend_origin.strip():
             origins.append(self.frontend_origin.strip().rstrip("/"))
         return list(dict.fromkeys(origins))
+
+    @property
+    def cors_origin_regex(self) -> str | None:
+        if self.allow_vercel_preview_origins or self.app_env != "production":
+            return r"https://.*\.vercel\.app"
+        return None
+
+    @property
+    def running_on_vercel(self) -> bool:
+        return os.environ.get("VERCEL") == "1" or bool(os.environ.get("VERCEL_ENV"))
 
 
 @lru_cache(maxsize=1)

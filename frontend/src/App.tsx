@@ -43,18 +43,18 @@ type JobLogPayload = {
 
 const EXAMPLE_GOALS = [
   {
-    label: "NBA salary demo",
-    goal: "Build a predictive dataset of NBA players with salary as the target and performance features",
+    label: "NBA salary",
+    goal: "I want to predict NBA player salary",
     guarantee: "Guaranteed hosted demo",
   },
   {
-    label: "NCAA team stats demo",
-    goal: "Build a predictive dataset of NCAA men's basketball team statistics",
+    label: "NCAA team strength",
+    goal: "I want to predict NCAA men's basketball team strength",
     guarantee: "Guaranteed hosted demo",
   },
   {
-    label: "U.S. states demo",
-    goal: "Build a predictive dataset of U.S. states with population growth as the target and GDP features",
+    label: "State population growth",
+    goal: "I want to predict U.S. state population growth",
     guarantee: "Guaranteed hosted demo",
   },
 ] as const;
@@ -74,9 +74,7 @@ const CONFIGURED_API_BASE =
   typeof import.meta !== "undefined" && import.meta.env.VITE_API_BASE_URL
     ? String(import.meta.env.VITE_API_BASE_URL)
     : "";
-const DEFAULT_API_BASE =
-  CONFIGURED_API_BASE.trim() ||
-  (typeof window !== "undefined" ? window.location.origin : "http://localhost:8000");
+const DEFAULT_API_BASE = CONFIGURED_API_BASE.trim();
 const IS_PRODUCTION_FRONTEND = CONFIGURED_API_BASE.trim().length > 0;
 
 function App() {
@@ -100,7 +98,7 @@ function App() {
 
     const intervalId = window.setInterval(async () => {
       try {
-        const nextJob = await fetchJson<JobPayload>(`${normalizedApiBase(apiBase)}/jobs/${job.job_id}`);
+        const nextJob = await fetchJson<JobPayload>(buildApiUrl(apiBase, `/jobs/${job.job_id}`));
         setJob(nextJob);
       } catch (pollError) {
         setError(getErrorMessage(pollError));
@@ -119,9 +117,7 @@ function App() {
 
     const loadLogs = async () => {
       try {
-        const payload = await fetchJson<JobLogPayload>(
-          `${normalizedApiBase(apiBase)}/jobs/${job.job_id}/logs?limit=160`,
-        );
+        const payload = await fetchJson<JobLogPayload>(buildApiUrl(apiBase, `/jobs/${job.job_id}/logs?limit=160`));
         if (!cancelled) {
           setLogs(payload.lines);
         }
@@ -166,8 +162,8 @@ function App() {
       setLoadingArtifacts(true);
       try {
         const [nextProfile, nextPreview] = await Promise.all([
-          fetchJson<ProfilePayload>(`${normalizedApiBase(apiBase)}/jobs/${jobId}/profile`),
-          fetchJson<PreviewPayload>(`${normalizedApiBase(apiBase)}/jobs/${jobId}/preview?limit=8`),
+          fetchJson<ProfilePayload>(buildApiUrl(apiBase, `/jobs/${jobId}/profile`)),
+          fetchJson<PreviewPayload>(buildApiUrl(apiBase, `/jobs/${jobId}/preview?limit=8`)),
         ]);
         if (!cancelled) {
           setProfile(nextProfile);
@@ -220,7 +216,7 @@ function App() {
 
     try {
       const created = await fetchJson<{ job_id: string; status: string }>(
-        `${normalizedApiBase(apiBase)}/jobs`,
+        buildApiUrl(apiBase, "/jobs"),
         {
           method: "POST",
           headers: {
@@ -233,7 +229,7 @@ function App() {
         },
       );
       const nextJob = await fetchJson<JobPayload>(
-        `${normalizedApiBase(apiBase)}/jobs/${created.job_id}`,
+        buildApiUrl(apiBase, `/jobs/${created.job_id}`),
       );
       setJob(nextJob);
     } catch (submitError) {
@@ -246,20 +242,20 @@ function App() {
   return (
     <div className="app-shell">
       <aside className="onboarding-strip">
-        <strong>Try the guaranteed demos first.</strong>
+        <strong>Start with a prediction target.</strong>
         <span>
-          NBA salary, NCAA team stats, and U.S. states all complete reliably on the hosted app and
-          show the full artifact flow.
+          Type what you want to predict, then the app will infer likely columns, rows, and sources
+          before building a validated table.
         </span>
       </aside>
       <header className="hero">
         <div className="hero-copy">
           <p className="eyebrow">Web Scraper</p>
-          <h1>Build a dataset, watch the pipeline, inspect the output.</h1>
+          <h1>Say what you want to predict. We build the table.</h1>
           <p className="lede">
-            A hosted control room for the dataset-generation pipeline. Use one of the guaranteed
-            demo goals below for the cleanest end-to-end walkthrough with logs, preview rows, and
-            artifact downloads.
+            Start with a prediction target like salary, valuation, or growth. The system will
+            infer useful columns, decide what each row should represent, search the web, validate
+            the data, and return a modeling-ready dataset.
           </p>
         </div>
         <div className="hero-card">
@@ -282,25 +278,29 @@ function App() {
         <section className="panel composer">
           <div className="panel-header">
             <h2>Start A Run</h2>
-            <span className="badge badge-neutral">Hosted Demo</span>
+            <span className="badge badge-neutral">Predictive Brief</span>
           </div>
           <div className="demo-callout">
-            <strong>Best path:</strong>
+            <strong>How it works:</strong>
             <span>
-              Start with one of the three example goals. Those are wired to deterministic hosted
-              demo datasets and should complete reliably on the deployed site.
+              Tell the app what you want to predict. It will think through the target, useful
+              feature columns, row entities, source pages, and validation steps before returning a
+              table.
             </span>
           </div>
           <form onSubmit={handleSubmit}>
             <label className="field">
-              <span>Dataset Goal</span>
+              <span>What do you want to predict?</span>
               <textarea
                 rows={6}
                 value={goal}
                 onChange={(event) => setGoal(event.target.value)}
-                placeholder="Describe the dataset you want to build"
+                placeholder="I want to predict home prices"
               />
             </label>
+            <p className="field-hint">
+              Start with “I want to predict …” and the app will turn that into a dataset plan.
+            </p>
             <div
               className={`selected-example${selectedExample ? "" : " selected-example-freeform"}`}
             >
@@ -308,7 +308,7 @@ function App() {
                 {selectedExample ? selectedExample.label : "Custom goal"}
               </span>
               <span className="selected-example-guarantee">
-                {selectedExample ? selectedExample.guarantee : "Best-effort live scraping"}
+                {selectedExample ? selectedExample.guarantee : "AI-generated dataset brief"}
               </span>
             </div>
 
@@ -330,7 +330,7 @@ function App() {
                   <input
                     value={apiBase}
                     onChange={(event) => setApiBase(event.target.value)}
-                    placeholder={DEFAULT_API_BASE}
+                    placeholder="Same origin or Vite proxy"
                   />
                 </label>
               ) : null}
@@ -412,16 +412,16 @@ function App() {
                   </div>
                   <div>
                     <dt>Goal</dt>
-                    <dd>{job.goal}</dd>
-                  </div>
+                <dd>{job.goal}</dd>
+              </div>
                 </dl>
 
                 {job.error ? <p className="error-text">{job.error}</p> : null}
               </>
             ) : (
               <p className="empty-state">
-                Start a run and this panel will track the job through schema design, source
-                fetching, synthesis, and export.
+                Submit a prediction target and this panel will show how the system turns it into a
+                dataset plan, source search, extraction run, and export.
               </p>
             )}
           </section>
@@ -491,13 +491,13 @@ function App() {
                 <article className="result-card">
                   <h3>Artifact Downloads</h3>
                   <div className="download-list">
-                    <a href={`${normalizedApiBase(apiBase)}/jobs/${job.job_id}/download/csv`} target="_blank" rel="noreferrer">
+                    <a href={buildApiUrl(apiBase, `/jobs/${job.job_id}/download/csv`)} target="_blank" rel="noreferrer">
                       Download CSV
                     </a>
-                    <a href={`${normalizedApiBase(apiBase)}/jobs/${job.job_id}/download/parquet`} target="_blank" rel="noreferrer">
+                    <a href={buildApiUrl(apiBase, `/jobs/${job.job_id}/download/parquet`)} target="_blank" rel="noreferrer">
                       Download Parquet
                     </a>
-                    <a href={`${normalizedApiBase(apiBase)}/jobs/${job.job_id}/download/profile`} target="_blank" rel="noreferrer">
+                    <a href={buildApiUrl(apiBase, `/jobs/${job.job_id}/download/profile`)} target="_blank" rel="noreferrer">
                       Download Profile JSON
                     </a>
                   </div>
@@ -549,10 +549,10 @@ function App() {
           ) : (
             <p className="empty-state">
               {job?.status === "failed"
-                ? "This run stopped before export because required sources blocked automated extraction."
+                ? "This run stopped before export because the system could not validate enough source data for the prediction task."
                 : job?.status === "partial_success"
-                  ? "This run gathered some rows but stopped early after repeated source blocking, so export artifacts were not produced."
-                  : "Completed runs will show profile metadata, a row preview, and artifact downloads here."}
+                  ? "This run gathered some rows but stopped early after repeated source blocking, so a final modeling table was not produced."
+                  : "Completed runs will show the generated modeling table, profile metadata, preview rows, and downloads here."}
             </p>
           )}
         </section>
@@ -565,6 +565,12 @@ function App() {
 
 function normalizedApiBase(value: string) {
   return value.trim().replace(/\/+$/, "");
+}
+
+function buildApiUrl(apiBase: string, path: string) {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const base = normalizedApiBase(apiBase);
+  return base ? `${base}${normalizedPath}` : normalizedPath;
 }
 
 function isTerminalJobStatus(status: JobStatus) {
@@ -634,7 +640,7 @@ function getJobNotice(job: JobPayload | null) {
     return {
       tone: "warning" as const,
       message:
-        "This run fell back to broader scraping. The guaranteed demo goals should avoid this path, but custom goals may take longer or stop early.",
+        "This run needed broader web discovery to assemble the predictive table, so it may take longer or stop early if source quality is weak.",
     };
   }
   return null;

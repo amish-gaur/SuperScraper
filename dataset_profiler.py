@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from pydantic import Field
@@ -27,6 +28,7 @@ class DatasetProfile:
     dropped_features: list[str]
     provenance_by_column: dict[str, str]
     leakage_warnings: list[str]
+    pruning_audit: dict[str, Any]
 
 
 class TargetInference(StructuredEnvelope):
@@ -55,6 +57,7 @@ class DatasetProfiler:
         *,
         goal: str,
         provenance_map: dict[str, str] | None = None,
+        pruning_audit: dict[str, Any] | None = None,
         llm_gateway: LLMGateway | None = None,
     ) -> DatasetProfile:
         numeric_columns = list(dataframe.select_dtypes(include=["number", "bool"]).columns)
@@ -69,13 +72,20 @@ class DatasetProfiler:
             column: int(dataframe[column].nunique(dropna=True))
             for column in dataframe.columns
         }
-        heuristic_target = self._infer_target_column(dataframe)
+        heuristic_target = self._infer_target_column(dataframe, goal=goal)
         target_inference = self._infer_target_with_llm(
             goal=goal,
             dataframe=dataframe,
             llm_gateway=llm_gateway,
         )
-        inferred_target = target_inference.inferred_target_column or heuristic_target
+        inferred_target = self._choose_best_target_candidate(
+            dataframe,
+            goal=goal,
+            candidates=[
+                target_inference.inferred_target_column,
+                heuristic_target,
+            ],
+        )
         dropped_features = self._normalize_dropped_features(
             target_inference.dropped_features,
             dataframe,
@@ -97,6 +107,7 @@ class DatasetProfiler:
                 column: "unknown_source" for column in dataframe.columns
             },
             leakage_warnings=leakage_warnings,
+            pruning_audit=pruning_audit or {},
         )
 
     def write(self, profile: DatasetProfile, output_dir: str | Path = ".") -> Path:
@@ -107,14 +118,27 @@ class DatasetProfiler:
         path.write_text(json.dumps(asdict(profile), indent=2, sort_keys=True), encoding="utf-8")
         return path
 
-    def _infer_target_column(self, dataframe: pd.DataFrame) -> str | None:
-        priority_tokens = ("target", "label", "outcome", "revenue", "price", "salary", "margin", "pct")
-        for column in dataframe.columns:
-            lowered = column.lower()
-            if any(token in lowered for token in priority_tokens):
-                return str(column)
-        numeric_columns = list(dataframe.select_dtypes(include=["number", "bool"]).columns)
-        return numeric_columns[-1] if numeric_columns else None
+    def _infer_target_column(self, dataframe: pd.DataFrame, *, goal: str = "") -> str | None:
+        if dataframe.empty:
+            return None
+        columns = list(map(str, dataframe.columns))
+        scored = sorted(
+            columns,
+            key=lambda column: self._target_column_score(
+                goal=goal,
+                column=column,
+                series=dataframe[column],
+            ),
+            reverse=True,
+        )
+        best = scored[0] if scored else None
+        if best is None:
+            return None
+        best_score = self._target_column_score(goal=goal, column=best, series=dataframe[best])
+        if best_score[0] <= 0:
+            numeric_columns = list(dataframe.select_dtypes(include=["number", "bool"]).columns)
+            return str(numeric_columns[-1]) if numeric_columns else None
+        return best
 
     def _infer_target_with_llm(
         self,
@@ -148,10 +172,10 @@ class DatasetProfiler:
                 max_tokens=500,
             )
         except LLMError:
-            return self._heuristic_target_inference(dataframe)
+            return self._heuristic_target_inference(dataframe, goal=goal)
 
-    def _heuristic_target_inference(self, dataframe: pd.DataFrame) -> TargetInference:
-        inferred_target = self._infer_target_column(dataframe)
+    def _heuristic_target_inference(self, dataframe: pd.DataFrame, *, goal: str = "") -> TargetInference:
+        inferred_target = self._infer_target_column(dataframe, goal=goal)
         lowered_columns = [column.lower() for column in dataframe.columns]
         if inferred_target and any(token in inferred_target.lower() for token in ("pct", "ratio", "price", "revenue", "assets", "salary", "margin")):
             task_type = "regression"
@@ -169,6 +193,73 @@ class DatasetProfiler:
             ml_task_type=task_type,
             dropped_features=dropped_features,
         )
+
+    def _choose_best_target_candidate(
+        self,
+        dataframe: pd.DataFrame,
+        *,
+        goal: str,
+        candidates: list[str | None],
+    ) -> str | None:
+        valid_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate and candidate in dataframe.columns
+        ]
+        if not valid_candidates:
+            return None
+        return max(
+            valid_candidates,
+            key=lambda column: self._target_column_score(
+                goal=goal,
+                column=column,
+                series=dataframe[column],
+            ),
+        )
+
+    def _target_column_score(self, *, goal: str, column: str, series: pd.Series) -> tuple[int, int, int, int]:
+        lowered = column.lower()
+        tokens = {token for token in lowered.replace("/", "_").split("_") if token}
+        goal_lower = goal.lower()
+        score = 0
+
+        if any(token in lowered for token in ("source", "url", "name", "entity_name", "id", "uuid")):
+            score -= 50
+        if pd.api.types.is_numeric_dtype(series):
+            score += 8
+        if "target" in tokens or "label" in tokens or "outcome" in tokens:
+            score += 30
+        if "salary" in goal_lower and "salary" in tokens:
+            score += 40
+        if any(token in goal_lower for token in ("valuation", "market value")) and "valuation" in tokens:
+            score += 40
+        if any(token in goal_lower for token in ("price", "pricing", "cost")) and "price" in tokens:
+            score += 40
+        if "revenue growth" in goal_lower and {"revenue", "growth"} <= tokens:
+            score += 40
+        elif "revenue" in goal_lower and "revenue" in tokens:
+            score += 35
+        if "population" in goal_lower and any(token in goal_lower for token in ("growth", "change")):
+            if "population" in tokens and ({"growth", "rate"} <= tokens or "change" in tokens):
+                score += 50
+            if "gdp" in tokens and any(token in tokens for token in ("growth", "change")):
+                score -= 20
+        if "gdp" in goal_lower and any(token in goal_lower for token in ("growth", "change")):
+            if "gdp" in tokens and any(token in tokens for token in ("growth", "change", "rate")):
+                score += 35
+        if any(token in goal_lower for token in ("win", "winning")) and any(token in tokens for token in ("winning", "wins", "pct")):
+            score += 25
+        if "points" in goal_lower and "points" in tokens:
+            score += 20
+
+        generic_priority_tokens = ("salary", "valuation", "price", "revenue", "income", "margin", "growth", "pct")
+        if any(token in lowered for token in generic_priority_tokens):
+            score += 10
+
+        non_null = int(series.notna().sum())
+        unique = int(series.nunique(dropna=True))
+        compact_name_bonus = max(0, 12 - min(len(tokens), 12))
+        return (score, non_null, compact_name_bonus, unique)
 
     def _normalize_dropped_features(self, dropped_features: list[str], dataframe: pd.DataFrame) -> list[str]:
         valid = []

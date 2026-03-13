@@ -122,6 +122,8 @@ class SourceRanker:
             "news": -3,
             "/news/": -3,
             "/story/": -3,
+            "statbunker.com": -10,
+            "nanoreview.net/en/laptop-list": -8,
         }
         for token, penalty in bad_signals.items():
             if token in full:
@@ -136,6 +138,9 @@ class SourceRanker:
         if parsed.path in {"", "/"} and host.count(".") >= 1:
             score -= 3
             reasons.append("homepage_penalty")
+            if any(domain in host for domain in ("statbunker.com", "forbes.com", "notebookcheck.net")):
+                score -= 3
+                reasons.append("generic_homepage_penalty")
 
         family = context.source_family_by_url.get(url)
         if family:

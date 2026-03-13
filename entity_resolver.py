@@ -41,7 +41,7 @@ class EntityResolver:
             or re.search(r"\d{3,5}\.[A-Z]{1,3}$", value)
             or re.search(r"[A-Za-z]+\d{2,5}$", value)
         )
-        value = re.sub(r"([a-z])([A-Z])", r"\1 \2", value)
+        value = re.sub(r"([a-z])([A-Z][a-z])", r"\1 \2", value)
         value = re.sub(r"([A-Za-z])(\d)", r"\1 \2", value)
         value = re.sub(r"(\d)([A-Za-z])", r"\1 \2", value)
         lowered = value.lower()

@@ -9,6 +9,7 @@ import pandas as pd
 from pydantic import BaseModel
 
 from goal_intent import infer_goal_cardinality
+from dataset_profiler import DatasetProfiler
 from html_table_extractor import HtmlTableExtractor
 from predictive_dataset_builder import PredictiveDatasetBuilder, _parse_money_value
 from source_health import FailureReason, FetchOutcome, REGISTRY
@@ -501,6 +502,103 @@ def test_finalize_frame_drops_duplicate_value_columns() -> None:
     assert list(finalized.columns).count("salary") == 1, finalized.columns
 
 
+def test_finalize_frame_repairs_entity_schema_column_from_name() -> None:
+    builder = PredictiveDatasetBuilder(
+        goal="Build a predictive dataset of NCAA men's basketball team statistics",
+        dataset_name="x",
+        starting_urls=[],
+        minimum_rows=2,
+        minimum_columns=4,
+        target_field="points_team",
+        core_feature_fields=["team", "overall_w_l_pct", "totals_fg_pct"],
+    )
+    frame = pd.DataFrame(
+        {
+            "entity_name": ["abilene christian", "air force"],
+            "raw_entity_name": ["Abilene Christian", "Air Force"],
+            "team": [2247.0, 1969.0],
+            "points_team": [2247.0, 1969.0],
+            "overall_w_l_pct": [0.438, 0.094],
+            "source_url": ["https://example.com/ncaa", "https://example.com/ncaa"],
+        }
+    )
+    finalized = builder._finalize_frame(frame)
+    assert finalized.loc[0, "team"] == "Abilene Christian"
+    assert finalized.loc[1, "team"] == "Air Force"
+
+
+def test_normalize_final_column_label_collapses_repeated_slug_segments() -> None:
+    builder = PredictiveDatasetBuilder(goal="state growth", dataset_name="x", starting_urls=[])
+    normalized = builder._normalize_final_column_label(
+        "annual_gdp_change_at_current_prices_2023_2024_1_annual_gdp_change_at_current_prices_2023_2024_1_2"
+    )
+    assert normalized == "annual_gdp_change_at_current_prices_2023_2024"
+
+
+def test_dataset_profiler_prefers_population_growth_target_for_state_goal() -> None:
+    profiler = DatasetProfiler()
+    dataframe = pd.DataFrame(
+        {
+            "state": ["Texas", "Florida"],
+            "population_growth_rate": [1.6, 1.9],
+            "gdp": [2660.0, 1590.0],
+            "real_gdp_growth_rate_2023_2024": [3.6, 3.2],
+            "annual_gdp_change_at_current_prices_2023_2024": [146000.0, 93000.0],
+        }
+    )
+    inferred = profiler._infer_target_column(
+        dataframe,
+        goal="Build a predictive dataset of U.S. states with population growth as the target and GDP features.",
+    )
+    assert inferred == "population_growth_rate"
+
+
+def test_dataset_profiler_prefers_salary_target_for_nba_goal() -> None:
+    profiler = DatasetProfiler()
+    dataframe = pd.DataFrame(
+        {
+            "name": ["Stephen Curry", "Nikola Jokic"],
+            "salary": [59606817, 55224526],
+            "salary_2025_26": [59606817, 55224526],
+            "points_per_game": [26.4, 26.2],
+        }
+    )
+    inferred = profiler._infer_target_column(
+        dataframe,
+        goal="Build a predictive dataset of NBA players with salary as the target and performance features.",
+    )
+    assert inferred == "salary"
+
+
+def test_dataset_profiler_profile_prefers_goal_aligned_target_over_bad_llm_guess() -> None:
+    profiler = DatasetProfiler()
+    dataframe = pd.DataFrame(
+        {
+            "state": ["Texas", "Florida"],
+            "population_growth_rate": [1.6, 1.9],
+            "median_income": [76000, 71000],
+            "gdp": [2660.0, 1590.0],
+        }
+    )
+
+    profiler._infer_target_with_llm = lambda **kwargs: type(
+        "FakeTargetInference",
+        (),
+        {
+            "inferred_target_column": "median_income",
+            "ml_task_type": "regression",
+            "dropped_features": [],
+        },
+    )()
+    profile = profiler.profile(
+        dataframe,
+        "US State Population Growth",
+        goal="Build a predictive dataset of U.S. states with population growth as the target and GDP features.",
+        llm_gateway=None,
+    )
+    assert profile.inferred_target_column == "population_growth_rate"
+
+
 def test_goal_aware_row_count_prefers_expected_table_size() -> None:
     builder = PredictiveDatasetBuilder(
         goal="Build a predictive dataset of NBA teams with playoff outcome target",
@@ -774,6 +872,11 @@ def main() -> int:
         test_prepare_frame_preserves_rank_when_schema_requires_it,
         test_finalize_frame_trims_excess_width_using_signal,
         test_finalize_frame_drops_duplicate_value_columns,
+        test_finalize_frame_repairs_entity_schema_column_from_name,
+        test_normalize_final_column_label_collapses_repeated_slug_segments,
+        test_dataset_profiler_prefers_population_growth_target_for_state_goal,
+        test_dataset_profiler_prefers_salary_target_for_nba_goal,
+        test_dataset_profiler_profile_prefers_goal_aligned_target_over_bad_llm_guess,
         test_goal_aware_row_count_prefers_expected_table_size,
         test_discover_ncaa_team_stat_urls_uses_filtered_option_values,
         test_extract_transfermarkt_club_summary_uses_shared_fetch_path,

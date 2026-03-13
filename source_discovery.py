@@ -10,6 +10,11 @@ from goal_intent import GoalDecomposition, decompose_goal
 from source_adapters import adapter_urls_for_goal
 from source_memory import SourceMemory
 
+KNOWN_STALE_URL_FRAGMENTS = (
+    "statbunker.com",
+    "nanoreview.net/en/laptop-list",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class DiscoveryCandidate:
@@ -47,6 +52,8 @@ class SourceDiscoveryEngine:
         for candidate in candidates:
             normalized = candidate.url.strip()
             if not normalized or normalized in seen:
+                continue
+            if any(fragment in normalized.lower() for fragment in KNOWN_STALE_URL_FRAGMENTS):
                 continue
             if any(domain in normalized.lower() for domain in forbidden_domains):
                 continue
@@ -152,12 +159,6 @@ class SourceDiscoveryEngine:
             candidates.extend(
                 [
                     DiscoveryCandidate(
-                        url="https://companiesmarketcap.com/largest-companies-by-market-cap/",
-                        expected_source_type="html_table",
-                        family="aggregator",
-                        rationale="market_leaderboard",
-                    ),
-                    DiscoveryCandidate(
                         url="https://www.forbes.com/lists/",
                         expected_source_type="browser_heavy",
                         family="publisher_list",
@@ -174,12 +175,6 @@ class SourceDiscoveryEngine:
                         family="aggregator",
                         rationale="sports_aggregator",
                     ),
-                    DiscoveryCandidate(
-                        url="https://www.statbunker.com/",
-                        expected_source_type="html_table",
-                        family="aggregator",
-                        rationale="sports_aggregator",
-                    ),
                 ]
             )
         elif decomposition.domain_intent == "ncaa-basketball":
@@ -187,12 +182,6 @@ class SourceDiscoveryEngine:
                 [
                     DiscoveryCandidate(
                         url="https://www.sports-reference.com/cbb/seasons/",
-                        expected_source_type="html_table",
-                        family="aggregator",
-                        rationale="sports_aggregator",
-                    ),
-                    DiscoveryCandidate(
-                        url="https://www.statbunker.com/",
                         expected_source_type="html_table",
                         family="aggregator",
                         rationale="sports_aggregator",
@@ -208,12 +197,6 @@ class SourceDiscoveryEngine:
                         family="aggregator",
                         rationale="sports_aggregator",
                     ),
-                    DiscoveryCandidate(
-                        url="https://www.statbunker.com/",
-                        expected_source_type="html_table",
-                        family="aggregator",
-                        rationale="sports_aggregator",
-                    ),
                 ]
             )
         if decomposition.domain_intent == "laptop":
@@ -224,12 +207,6 @@ class SourceDiscoveryEngine:
                         expected_source_type="html_table",
                         family="aggregator",
                         rationale="hardware_rankings",
-                    ),
-                    DiscoveryCandidate(
-                        url="https://nanoreview.net/en/laptop-list",
-                        expected_source_type="html_table",
-                        family="aggregator",
-                        rationale="hardware_comparison_index",
                     ),
                 ]
             )

@@ -1,6 +1,6 @@
 # Deployment
 
-This document covers service readiness, required runtime configuration, and the normal commands for running the CLI, API, and worker in a deployment-oriented environment.
+This document covers service readiness, required runtime configuration, and the normal commands for running the CLI and API in a deployment-oriented environment.
 
 ## Recommended split
 
@@ -9,7 +9,21 @@ For the easiest ongoing updates:
 - deploy the frontend from [`frontend/`](frontend) to Vercel
 - deploy the Python API from the repo root to Render as a single web service
 
-This project can run without a separate worker for hobby/demo use because the API already falls back to in-process job execution when Redis is unavailable.
+This project runs jobs in-process by default, which keeps the first deployment to a single service.
+
+## Single-project Vercel option
+
+The repo root can also be deployed directly to Vercel now:
+
+- [`index.py`](index.py) exposes the FastAPI app as the Vercel entrypoint
+- [`vercel.json`](vercel.json) builds the Vite frontend before packaging the Python app
+- the API serves [`frontend/dist`](frontend/dist) so the website and backend share one domain
+
+Important caveat:
+
+- Vercel serverless functions are not a good fit for detached background threads, so `POST /jobs` now runs the pipeline inline on Vercel and only returns after the job finishes or fails
+- that keeps the deployed website functional, but long scraping jobs can still hit Vercel execution limits
+- if you need durable background execution, keep using the Vercel frontend plus Render backend split
 
 ## Cost reality
 
@@ -56,6 +70,7 @@ python3 main.py --goal "Build a predictive dataset of startup companies with val
 - Browser fallback depends on the `agent-browser` binary. Set `AGENT_BROWSER_BIN` if it is not on `PATH`.
 - LLM-backed schema design and synthesis require one of `OPENAI_API_KEY`, `GEMINI_API_KEY`, or `GROQ_API_KEY`.
 - If no API key is configured, deterministic routing still works, but LLM extraction from hidden JSON state is skipped.
+- Background jobs are disabled in the default deployment, so Redis is not required.
 
 ## Render backend
 
@@ -74,7 +89,7 @@ Suggested setup:
 Notes:
 
 - `render.yaml` sets `ARTIFACT_ROOT=/tmp/artifacts` to avoid requiring a persistent disk for the first deploy.
-- `REDIS_URL` is present for compatibility, but the API can still run in-process when Redis is unreachable.
+- `ENABLE_BACKGROUND_JOBS=false` keeps the deployed service single-process and avoids any Redis dependency.
 
 ## Vercel frontend
 
@@ -90,6 +105,41 @@ https://web-scraper-api.onrender.com
 ```
 
 The frontend environment example is included at [`frontend/.env.example`](frontend/.env.example).
+
+### Canonical production URL
+
+If users are still reaching an old or broken Vercel URL, remove that alias from the deployment instead of leaving two public entry points active.
+
+Recommended cleanup in the Vercel dashboard:
+
+1. Open the project in Vercel.
+2. Go to `Settings` -> `Domains`.
+3. Find the broken `*.vercel.app` or custom domain entry.
+4. Remove or unassign that domain from the old deployment.
+5. Keep only the single production URL that should remain user-facing.
+
+If you intentionally want one host to redirect to another and both hosts belong to the same Vercel project, add a host-based redirect in [`frontend/vercel.json`](frontend/vercel.json) once you know the exact legacy hostname:
+
+```json
+{
+  "framework": null,
+  "redirects": [
+    {
+      "source": "/:path*",
+      "has": [
+        {
+          "type": "host",
+          "value": "legacy-hostname.example.com"
+        }
+      ],
+      "destination": "https://your-canonical-production-url/:path*",
+      "permanent": true
+    }
+  ]
+}
+```
+
+Use the dashboard unassign flow when the old hostname should simply stop serving traffic.
 
 ## Easy updates later
 

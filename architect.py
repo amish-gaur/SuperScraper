@@ -126,7 +126,7 @@ class DatasetArchitect:
             "In Feature Brainstorming, identify the single Target Variable that should be predicted, then generate 3 to 5 logical, high-signal Predictive Features that are likely to causally or statistically help predict that target. "
             "Favor observable columns that are causally or statistically useful for prediction and likely to appear together on a single public list, directory, aggregator, table, or index page. "
             "Strictly exclude low-signal, decorative, or administrative fields such as jersey colors, website URLs, logos, random IDs, UUIDs, slugs, internal keys, and other metadata that would not materially help a supervised model. "
-            "The row schema must contain exactly one target field plus the 3 to 5 brainstormed predictive feature fields, and those brainstormed features must all be present in row_schema.fields and row_schema.required. "
+            "The row schema must contain exactly one target field plus the 3 to 5 brainstormed predictive feature fields, and those brainstormed features must all be present in row_schema.fields. "
             "Use strict primitive types only: numerical or continuous values must be integer or number, binary indicators must be boolean, and categorical/text values must be string. "
             "Every field description must explain why the value is being extracted for modeling, not just what it is. "
             "Do not plan around search engines. Instead, identify likely public source domains and return direct source targets "
@@ -151,7 +151,8 @@ class DatasetArchitect:
             "- First decide the primary target variable and set row_schema.target_field to that field name.\n"
             "- Include exactly one field with ml_role=\"target\".\n"
             "- Include 3 to 5 additional brainstormed fields with ml_role=\"feature\".\n"
-            "- Every brainstormed feature must appear in row_schema.required so the extractor schema strictly asks for it.\n"
+            "- Put the target and any non-nullable fields in row_schema.required.\n"
+            "- Nullable brainstormed features may remain optional in row_schema.required, but they must still appear in row_schema.fields.\n"
             "- Each field description must state why that field matters for prediction.\n"
             "- Do not include URLs, IDs, decorative attributes, or provenance-only columns in the row schema.\n\n"
             "The source targets should be direct entry points to data-rich list pages such as roster pages, statistics indexes, public directories, "
@@ -194,7 +195,6 @@ class DatasetArchitect:
         ]
 
         raw_required = list(blueprint.row_schema.required or inferred_required)
-        raw_required.extend(declared_fields)
         normalized_required: list[str] = []
         seen: set[str] = set()
         for field_name in raw_required:
@@ -884,7 +884,11 @@ class DatasetArchitect:
         return (
             self._should_use_deterministic_blueprint(goal)
             or ("state" in lowered and "population" in lowered)
-            or ("ncaa" in lowered and "basketball" in lowered and "team statistics" in lowered)
+            or (
+                "ncaa" in lowered
+                and "basketball" in lowered
+                and any(token in lowered for token in ("team statistics", "team strength", "teams"))
+            )
             or (
                 any(token in lowered for token in ("laptop", "laptops", "notebook", "notebooks"))
                 and any(token in lowered for token in ("spec", "specs", "price", "prices", "pc"))
@@ -934,7 +938,9 @@ class DatasetArchitect:
         """Produce a usable blueprint for common list-oriented goals without an LLM."""
         lowered = goal.lower()
 
-        if "ncaa" in lowered and "basketball" in lowered and "team statistics" in lowered:
+        if "ncaa" in lowered and "basketball" in lowered and any(
+            token in lowered for token in ("team statistics", "team strength", "teams")
+        ):
             return DatasetBlueprint(
                 dataset_name="NCAA Men S Basketball Team Statistics",
                 dataset_description="Wide dataset of NCAA Division I men's basketball team performance statistics from public aggregate tables.",

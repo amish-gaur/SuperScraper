@@ -36,7 +36,7 @@ The project is strongest when the target data exists on public rankings, directo
 
 - Predictive datasets from public stat tables and list pages
 - Deterministic handling for several common goal families
-- API mode, worker mode, and local CLI mode
+- API mode and local CLI mode
 - Regression coverage for routing, heuristics, and dataset assembly
 
 ## Current limits
@@ -65,7 +65,7 @@ export OPENAI_API_KEY=...
 Run a build:
 
 ```bash
-python3 main.py --goal "Build a predictive dataset of NBA players with salary as the target and performance features" --max-agents 3
+python3 main.py --goal "I want to predict NBA player salary" --max-agents 3
 ```
 
 Output is written under the working directory or configured artifact directory.
@@ -75,9 +75,9 @@ Output is written under the working directory or configured artifact directory.
 These are the kinds of requests the system handles best:
 
 ```text
-Build a predictive dataset of NCAA men's basketball team statistics
-Build a predictive dataset of U.S. states with population growth as the target and GDP features
-I want data to predict how much an NBA player gets paid using on-court performance stats
+I want to predict NCAA men's basketball team strength
+I want to predict U.S. state population growth
+I want to predict NBA player salary
 Put together a machine-learning table for startup companies where valuation is the label and funding is a key predictor
 Give me a dataset for the biggest U.S. banks so I can estimate market value from asset size and capital strength
 I need laptop pricing data where the thing to predict is price and the inputs are hardware specs
@@ -104,7 +104,7 @@ python3 main.py --doctor
 
 ## API
 
-Run the stack:
+Run the API:
 
 ```bash
 docker compose up --build
@@ -151,6 +151,8 @@ http://localhost:5173
 ```
 
 The frontend submits dataset jobs, polls job status, shows pipeline stages, fetches the dataset profile, renders a small row preview, and links to artifact downloads.
+Jobs run in-process by default, so you do not need Redis for local demos or the first deploy.
+In local development, Vite now proxies `/jobs` and `/healthz` to the FastAPI server on `http://127.0.0.1:8000`, so you should not need to type an API base URL manually.
 
 ## Important files
 
@@ -158,10 +160,8 @@ The frontend submits dataset jobs, polls job status, shows pipeline stages, fetc
   CLI entrypoint and setup flow.
 - [`api.py`](api.py)
   FastAPI service for queued jobs.
-- [`worker.py`](worker.py)
-  Celery worker for background execution.
 - [`pipeline_service.py`](pipeline_service.py)
-  Shared orchestration for CLI, API, and worker paths.
+  Shared orchestration for CLI and API paths.
 - [`architect.py`](architect.py)
   Goal interpretation, source selection, and schema planning.
 - [`predictive_dataset_builder.py`](predictive_dataset_builder.py)

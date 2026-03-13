@@ -24,7 +24,9 @@ def demo_dataset_for_goal(goal: str) -> DemoDataset | None:
         return _nba_salary_demo()
     if domain == "public-data" and entity == "state":
         return _state_growth_demo()
-    if domain == "ncaa-basketball" and "team statistics" in lowered:
+    if domain == "ncaa-basketball" and any(
+        phrase in lowered for phrase in ("team statistics", "team strength", "teams")
+    ):
         return _ncaa_team_demo()
     return None
 

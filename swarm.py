@@ -17,9 +17,20 @@ from crawlee_fetcher import CrawleeStaticRequestProcessor
 from extraction_router import ExtractionRouter
 from llm import LLMGateway
 from source_ranker import SourceRanker
+from source_health import FailureReason
 
 
 LOGGER = logging.getLogger(__name__)
+FAIL_FAST_HIGH_PRIORITY_SOURCES = 4
+FAIL_FAST_CONSECUTIVE_REJECTIONS = 3
+FAIL_FAST_REASONS = {
+    FailureReason.EMPTY_CONTENT,
+    FailureReason.HTTP_403,
+    FailureReason.HTTP_429,
+    FailureReason.NETWORK_ERROR,
+    FailureReason.ANTI_BOT,
+    FailureReason.BROWSER_ERROR,
+}
 
 
 @dataclass(slots=True)
@@ -37,6 +48,62 @@ class BrowserStageResult:
     records: list[BaseModel]
     attempted_urls: int = 0
     failed_urls: int = 0
+
+
+class SwarmAbortError(RuntimeError):
+    """Raised when the swarm detects a persistent blocked-source pattern."""
+
+    def __init__(self, message: str, *, partial_records: int, detail: dict[str, object]) -> None:
+        super().__init__(message)
+        self.partial_records = partial_records
+        self.detail = detail
+
+
+@dataclass(slots=True)
+class FailFastTracker:
+    """Track repeated high-priority source rejection and abort early when it becomes overwhelming."""
+
+    high_priority_urls: set[str]
+    threshold: int = FAIL_FAST_CONSECUTIVE_REJECTIONS
+    consecutive_rejections: int = 0
+    last_url: str | None = None
+    last_reason: str | None = None
+
+    def observe(
+        self,
+        *,
+        url: str,
+        reason: FailureReason | None,
+        extracted_records: int = 0,
+    ) -> None:
+        if url not in self.high_priority_urls:
+            return
+        if extracted_records > 0:
+            self.consecutive_rejections = 0
+            self.last_url = url
+            self.last_reason = FailureReason.SUCCESS.value
+            return
+        if reason not in FAIL_FAST_REASONS:
+            self.consecutive_rejections = 0
+            self.last_url = url
+            self.last_reason = getattr(reason, "value", None)
+            return
+        self.consecutive_rejections += 1
+        self.last_url = url
+        self.last_reason = reason.value
+
+    def should_abort(self) -> bool:
+        return self.consecutive_rejections >= self.threshold
+
+    def detail(self) -> dict[str, object]:
+        return {
+            "failure_kind": "source_rejection",
+            "high_priority_sources": len(self.high_priority_urls),
+            "consecutive_rejections": self.consecutive_rejections,
+            "threshold": self.threshold,
+            "last_url": self.last_url,
+            "last_reason": self.last_reason,
+        }
 
 
 @dataclass(slots=True)
@@ -134,6 +201,11 @@ class SwarmDispatcher:
         """Route static sources through Crawlee before browser fallback."""
         records: list[BaseModel] = []
         browser_targets: list[SourceTarget] = []
+        fail_fast_tracker = FailFastTracker(
+            high_priority_urls={
+                target.url for target in source_targets[: min(len(source_targets), FAIL_FAST_HIGH_PRIORITY_SOURCES)]
+            }
+        )
 
         static_targets: list[SourceTarget] = []
         remaining_targets: list[SourceTarget] = []
@@ -156,6 +228,11 @@ class SwarmDispatcher:
                     fetched_target.fetch_result,
                     adapter=fetched_target.adapter,
                 )
+                fail_fast_tracker.observe(
+                    url=fetched_target.source_target.url,
+                    reason=decision.fetch_outcome.reason if decision.fetch_outcome is not None else None,
+                    extracted_records=len(decision.records),
+                )
                 if decision.records:
                     LOGGER.info(
                         "Extraction router produced %d records at %s via %s",
@@ -166,6 +243,11 @@ class SwarmDispatcher:
                     records.extend(decision.records)
                 elif decision.requires_browser:
                     browser_targets.append(fetched_target.source_target)
+                if fail_fast_tracker.should_abort():
+                    self._raise_fail_fast_abort(
+                        tracker=fail_fast_tracker,
+                        partial_records=len(records),
+                    )
 
         browser_targets.extend(remaining_targets)
         LOGGER.info(
@@ -199,6 +281,11 @@ class SwarmDispatcher:
         attempted_urls = 0
         failed_urls = 0
         collected_records: list[BaseModel] = []
+        fail_fast_tracker = FailFastTracker(
+            high_priority_urls={
+                target.url for target in browser_targets[: min(len(browser_targets), FAIL_FAST_HIGH_PRIORITY_SOURCES)]
+            }
+        )
         per_agent_target = max(1, -(-remaining_target // max(self.agent_count, 1)))
         browser_urls = [target.url for target in browser_targets]
         LOGGER.info("Browser fallback stage starting for %d candidate URLs", len(browser_urls))
@@ -233,11 +320,28 @@ class SwarmDispatcher:
             LOGGER.info("Launching %d browser agents", len(agents))
             results = await asyncio.gather(*(agent.run() for agent in agents), return_exceptions=True)
             for index, result in enumerate(results, start=batch_start + 1):
+                url = batch_urls[index - batch_start - 1]
                 if isinstance(result, Exception):
                     failed_urls += 1
                     LOGGER.warning("Browser agent %d failed: %s", index, result)
+                    fail_fast_tracker.observe(url=url, reason=FailureReason.BROWSER_ERROR, extracted_records=0)
+                    if fail_fast_tracker.should_abort():
+                        self._raise_fail_fast_abort(
+                            tracker=fail_fast_tracker,
+                            partial_records=len(existing_records) + len(collected_records),
+                        )
                     continue
+                fail_fast_tracker.observe(
+                    url=url,
+                    reason=FailureReason.EMPTY_CONTENT if not result else FailureReason.SUCCESS,
+                    extracted_records=len(result),
+                )
                 collected_records.extend(result)
+                if fail_fast_tracker.should_abort():
+                    self._raise_fail_fast_abort(
+                        tracker=fail_fast_tracker,
+                        partial_records=len(existing_records) + len(collected_records),
+                    )
             if collected_records:
                 break
 
@@ -396,6 +500,19 @@ class SwarmDispatcher:
                 populated += 1
             populated_counts.append(populated)
         return sum(populated_counts) / len(populated_counts)
+
+    def _raise_fail_fast_abort(self, *, tracker: FailFastTracker, partial_records: int) -> None:
+        message = (
+            "Required data sources actively blocked the automated extraction attempt. "
+            "Aborting early because the hosting environment appears to be using blocked datacenter IPs."
+        )
+        detail = tracker.detail() | {"partial_records": partial_records}
+        LOGGER.critical(
+            "CRITICAL: Aborting job due to overwhelming source rejection (Datacenter IP Block likely). "
+            "detail=%s",
+            detail,
+        )
+        raise SwarmAbortError(message, partial_records=partial_records, detail=detail)
 
 
 def _root_domain(url: str) -> str:

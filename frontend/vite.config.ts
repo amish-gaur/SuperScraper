@@ -6,5 +6,12 @@ export default defineConfig({
   server: {
     port: 5173,
     host: "0.0.0.0",
+    proxy: {
+      "/healthz": "http://127.0.0.1:8000",
+      "/jobs": "http://127.0.0.1:8000",
+      "/docs": "http://127.0.0.1:8000",
+      "/openapi.json": "http://127.0.0.1:8000",
+      "/redoc": "http://127.0.0.1:8000",
+    },
   },
 });

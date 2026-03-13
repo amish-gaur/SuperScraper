@@ -115,30 +115,40 @@ def run_pipeline(
             columns=len(validation_result.dataframe.columns),
         )
 
-    predictive_builder = PredictiveDatasetBuilder(
-        goal=goal,
-        dataset_name=blueprint.dataset_name,
-        starting_urls=blueprint.starting_urls,
-        target_field=blueprint.row_schema.target_field,
-        core_feature_fields=[
+    builder_kwargs = {
+        "goal": goal,
+        "dataset_name": blueprint.dataset_name,
+        "starting_urls": blueprint.starting_urls,
+        "target_field": blueprint.row_schema.target_field,
+        "core_feature_fields": [
             field.name
             for field in blueprint.row_schema.fields
             if field.ml_role == "feature"
         ],
-        required_feature_fields=[
+        "required_feature_fields": [
             field.name
             for field in blueprint.row_schema.fields
             if field.ml_role == "feature" and not field.nullable
         ],
-        domain_blacklist=domain_blacklist,
-        llm_gateway=llm_gateway,
-        progress_callback=lambda message, detail: _notify(
+        "domain_blacklist": domain_blacklist,
+        "llm_gateway": llm_gateway,
+        "progress_callback": lambda message, detail: _notify(
             progress_callback,
             stage="predictive_builder",
             message=message,
             detail=detail,
         ),
-    )
+    }
+    try:
+        predictive_builder = PredictiveDatasetBuilder(**builder_kwargs)
+    except TypeError as exc:
+        if "required_feature_fields" not in str(exc):
+            raise
+        LOGGER.warning(
+            "PredictiveDatasetBuilder does not accept required_feature_fields in this runtime; retrying without it"
+        )
+        builder_kwargs.pop("required_feature_fields", None)
+        predictive_builder = PredictiveDatasetBuilder(**builder_kwargs)
     if predictive_builder.is_applicable():
         _notify(
             progress_callback,

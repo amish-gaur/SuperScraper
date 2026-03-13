@@ -69,6 +69,13 @@ def test_entity_resolver_handles_nullish_values() -> None:
     assert resolver.canonical_key("nan") == ""
 
 
+def test_entity_resolver_preserves_startup_brand_names() -> None:
+    resolver = EntityResolver()
+    assert resolver.canonical_key("SpaceX") == "spacex"
+    assert resolver.canonical_key("OpenAI") == "openai"
+    assert resolver.canonical_key("ScaleAI") == "scaleai"
+
+
 def test_list_page_extractor_derives_multiword_school_name() -> None:
     extractor = ListPageExtractor(TeamRow)
     records = extractor.extract(
@@ -184,6 +191,14 @@ def test_source_discovery_generates_non_search_seed_candidates() -> None:
     assert any("census.gov" in url for url in urls)
     assert any("wikipedia.org" in url for url in urls)
     assert all("google.com/search" not in url for url in urls)
+
+
+def test_source_discovery_avoids_known_stale_domains() -> None:
+    discovery = SourceDiscoveryEngine()
+    laptop_urls = [candidate.url for candidate in discovery.discover("Build a dataset of laptop prices and specs", limit=20)]
+    ncaa_urls = [candidate.url for candidate in discovery.discover("Build a predictive dataset of NCAA men's basketball team statistics", limit=20)]
+    assert all("nanoreview.net/en/laptop-list" not in url for url in laptop_urls), laptop_urls
+    assert all("statbunker.com" not in url for url in ncaa_urls), ncaa_urls
 
 
 def test_predictive_builder_normalizes_lowercase_numeric_suffixes() -> None:
@@ -423,6 +438,7 @@ def test_predictive_builder_rejects_low_fill_rate() -> None:
 def main(*, verbose: bool = True) -> int:
     tests = [
         test_entity_resolver_handles_nullish_values,
+        test_entity_resolver_preserves_startup_brand_names,
         test_list_page_extractor_derives_multiword_school_name,
         test_architect_infers_score_as_target_field,
         test_architect_uses_deterministic_blueprint_for_weird_nba_salary_goal,
@@ -433,6 +449,7 @@ def main(*, verbose: bool = True) -> int:
         test_goal_decomposition_extracts_target_features_and_temporal_scope,
         test_source_memory_reuses_similar_goal_sources,
         test_source_discovery_generates_non_search_seed_candidates,
+        test_source_discovery_avoids_known_stale_domains,
         test_predictive_builder_normalizes_lowercase_numeric_suffixes,
         test_predictive_builder_accepts_estimate_wording_for_bank_goal,
         test_semantic_validator_rejects_negative_and_inverted_ranges,

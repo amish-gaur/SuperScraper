@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from io import StringIO
-import json
 import logging
 import re
 from typing import Any, Callable
@@ -18,7 +17,8 @@ import urllib3
 from crawlee_fetcher import CrawleeFetcher
 from entity_resolver import EntityResolver
 from goal_intent import infer_domain_intent, infer_entity_intent, infer_goal_cardinality
-from llm import LLMError, LLMGateway
+from llm import LLMGateway
+from post_extraction_pruner import PostExtractionPruner
 from source_adapters import adapter_urls_for_goal
 from source_discovery import SourceDiscoveryEngine
 from source_health import FailureReason, fetch_url, REGISTRY
@@ -28,7 +28,6 @@ from source_ranker import SourceRanker
 LOGGER = logging.getLogger(__name__)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 IDENTITY_COLUMNS = {"name", "entity_name", "raw_entity_name", "source_url"}
-PROTECTED_METADATA_COLUMNS = {"name", "entity_name", "raw_entity_name", "source", "source_url"}
 PredictiveProgressCallback = Callable[[str, dict[str, Any] | None], None]
 
 
@@ -71,6 +70,16 @@ ENTITY_COLUMN_CANDIDATES = (
     "title",
 )
 DROP_COLUMNS = {"rk", "rank", "unnamed_0", "unnamed_1"}
+ENTITY_SCHEMA_FIELDS = {
+    "bank",
+    "club",
+    "company",
+    "company_name",
+    "player",
+    "school",
+    "state",
+    "team",
+}
 NCAA_TEAM_STAT_ALLOWLIST = {
     "145",
     "146",
@@ -137,16 +146,26 @@ class PredictiveDatasetBuilder:
     max_candidate_urls: int = 12
     target_field: str | None = None
     core_feature_fields: list[str] = field(default_factory=list)
+    required_feature_fields: list[str] = field(default_factory=list)
     domain_blacklist: set[str] = field(default_factory=set)
     source_ranker: SourceRanker = field(default_factory=SourceRanker)
     source_discovery: SourceDiscoveryEngine = field(default_factory=SourceDiscoveryEngine)
     entity_resolver: EntityResolver = field(default_factory=EntityResolver)
     progress_callback: PredictiveProgressCallback | None = None
     llm_gateway: LLMGateway | None = None
+    post_extraction_pruner: PostExtractionPruner | None = None
     crawlee_fetcher: CrawleeFetcher = field(init=False)
 
     def __post_init__(self) -> None:
         self.crawlee_fetcher = CrawleeFetcher(timeout_seconds=self.timeout_seconds)
+        if self.post_extraction_pruner is None:
+            self.post_extraction_pruner = PostExtractionPruner(
+                goal=self.goal,
+                target_field=self.target_field,
+                core_feature_fields=list(self.core_feature_fields),
+                required_feature_fields=list(self.required_feature_fields),
+                llm_gateway=self.llm_gateway,
+            )
 
     def is_applicable(self) -> bool:
         tokens = set(re.findall(r"[a-z0-9]+", self.goal.lower()))
@@ -215,6 +234,12 @@ class PredictiveDatasetBuilder:
             return None
 
         merged = self._finalize_frame(merged)
+        merged_post = self.post_extraction_pruner.process(
+            merged,
+            provenance_map=merged_provenance,
+        )
+        merged = merged_post.dataframe
+        merged_provenance = merged_post.provenance_map
         merged_quality_error: DataQualityError | None = None
         try:
             self._enforce_fill_rate(merged)
@@ -228,12 +253,21 @@ class PredictiveDatasetBuilder:
             and self._frame_row_count_is_reasonable(merged)
         ):
             merged_provenance = self._finalize_provenance(merged, merged_provenance)
-            return PredictiveBuildResult(dataframe=merged, provenance_map=merged_provenance)
+            return PredictiveBuildResult(
+                dataframe=merged,
+                provenance_map=merged_provenance,
+                pruning_audit=merged_post.pruning_audit,
+            )
 
         best_frame = self._best_single_frame(prepared_frames)
         if best_frame is None:
             return None
         best_frame = self._finalize_frame(best_frame)
+        best_post = self.post_extraction_pruner.process(
+            best_frame,
+            provenance_map=dict(getattr(best_frame, "attrs", {}).get("provenance_map", {})),
+        )
+        best_frame = best_post.dataframe
         if (
             len(best_frame) < self.minimum_rows
             or len(best_frame.columns) < self.minimum_columns
@@ -246,11 +280,13 @@ class PredictiveDatasetBuilder:
             if merged_quality_error is not None:
                 raise merged_quality_error
             raise
-        best_provenance = self._finalize_provenance(
-            best_frame,
-            dict(getattr(best_frame, "attrs", {}).get("provenance_map", {})),
+        best_provenance = self._finalize_provenance(best_frame, best_post.provenance_map)
+        return PredictiveBuildResult(
+            dataframe=best_frame,
+            provenance_map=best_provenance,
+            pruning_audit=best_post.pruning_audit,
         )
-        return PredictiveBuildResult(dataframe=best_frame, provenance_map=best_provenance)
+
 
     def _goal_specific_frame_subset(self, frames: list[pd.DataFrame]) -> list[pd.DataFrame]:
         if not frames:
@@ -690,6 +726,7 @@ class PredictiveDatasetBuilder:
         finalized = finalized.rename(columns=self._final_column_label_map(finalized.columns))
         finalized = self._collapse_duplicate_named_columns(finalized)
         finalized = self._apply_schema_aliases(finalized)
+        finalized = self._repair_entity_schema_columns(finalized)
         finalized = self._drop_duplicate_value_columns(finalized)
 
         ordered = self._order_final_columns(finalized)
@@ -710,82 +747,7 @@ class PredictiveDatasetBuilder:
         ]
         finalized = finalized[keep_columns]
         finalized = self._trim_excess_columns(finalized)
-        finalized = self.prune_dataset(finalized, self.target_field or "")
         return finalized.reset_index(drop=True)
-
-    def prune_dataset(self, df: pd.DataFrame, target_col: str) -> pd.DataFrame:
-        """Drop unusable rows and columns before the final ML quality gate."""
-        pruned = df.copy()
-        if pruned.empty:
-            return pruned
-
-        target_column = self._resolve_quality_column(pruned, [target_col] if target_col else [])
-        if target_column is None:
-            LOGGER.info("Skipping dataset pruning because target column '%s' could not be resolved", target_col)
-            return pruned.reset_index(drop=True)
-
-        original_row_count = len(pruned)
-        original_columns = list(map(str, pruned.columns))
-
-        missing_target_mask = self._series_missing_mask(pruned[target_column])
-        rows_missing_target = int(missing_target_mask.sum())
-        if rows_missing_target:
-            pruned = pruned.loc[~missing_target_mask].copy()
-
-        feature_columns = [
-            column
-            for column in pruned.columns
-            if column != target_column and str(column) not in PROTECTED_METADATA_COLUMNS
-        ]
-        rows_sparse_features = 0
-        if feature_columns:
-            feature_missing = pd.DataFrame(
-                {str(column): self._series_missing_mask(pruned[column]) for column in feature_columns},
-                index=pruned.index,
-            )
-            rows_sparse_mask = feature_missing.mean(axis=1) > 0.50
-            rows_sparse_features = int(rows_sparse_mask.sum())
-            if rows_sparse_features:
-                pruned = pruned.loc[~rows_sparse_mask].copy()
-
-        sparse_columns = [
-            str(column)
-            for column in pruned.columns
-            if column != target_column and self._missing_rate(pruned[column]) > 0.40
-        ]
-        if sparse_columns:
-            pruned = pruned.drop(columns=sparse_columns, errors="ignore")
-
-        zero_variance_columns = [
-            str(column)
-            for column in pruned.columns
-            if column != target_column and self._has_zero_variance(pruned[column])
-        ]
-        if zero_variance_columns:
-            pruned = pruned.drop(columns=zero_variance_columns, errors="ignore")
-
-        semantic_columns = self._semantic_prune_columns(pruned, target_column=target_column)
-        if semantic_columns:
-            pruned = pruned.drop(columns=semantic_columns, errors="ignore")
-
-        remaining_columns = [column for column in original_columns if column in pruned.columns]
-        pruned = pruned.loc[:, remaining_columns]
-        LOGGER.info(
-            "Pruned dataset rows/columns: dropped %d rows missing target, %d rows with >50%% missing features, %d sparse columns, %d zero-variance columns, %d semantically irrelevant columns",
-            rows_missing_target,
-            rows_sparse_features,
-            len(sparse_columns),
-            len(zero_variance_columns),
-            len(semantic_columns),
-        )
-        if sparse_columns:
-            LOGGER.info("Dropped sparse columns: %s", ", ".join(sorted(sparse_columns)))
-        if zero_variance_columns:
-            LOGGER.info("Dropped zero-variance columns: %s", ", ".join(sorted(zero_variance_columns)))
-        if semantic_columns:
-            LOGGER.info("Dropped semantically irrelevant columns for target '%s': %s", target_column, ", ".join(sorted(semantic_columns)))
-        LOGGER.info("Dataset size changed from %d rows / %d columns to %d rows / %d columns", original_row_count, len(original_columns), len(pruned), len(pruned.columns))
-        return pruned.reset_index(drop=True)
 
     def _apply_schema_aliases(self, frame: pd.DataFrame) -> pd.DataFrame:
         aliased = frame.copy()
@@ -1010,6 +972,9 @@ class PredictiveDatasetBuilder:
         parts = [part for part in str(column).split("_") if part]
         if not parts:
             return column
+        parts = self._collapse_repeated_column_parts(parts)
+        while len(parts) > 4 and parts[-1].isdigit() and len(parts[-1]) <= 2:
+            parts = parts[:-1]
         cleaned_parts: list[str] = []
         for part in parts:
             if cleaned_parts and part == cleaned_parts[-1]:
@@ -1018,6 +983,18 @@ class PredictiveDatasetBuilder:
         if len(cleaned_parts) >= 2 and cleaned_parts[-1] == "value":
             cleaned_parts = cleaned_parts[:-1]
         return "_".join(cleaned_parts) or column
+
+    def _collapse_repeated_column_parts(self, parts: list[str]) -> list[str]:
+        if len(parts) < 4:
+            return parts
+        for size in range(2, (len(parts) // 2) + 1):
+            prefix = parts[:size]
+            if parts[size : size * 2] != prefix:
+                continue
+            remainder = parts[size * 2 :]
+            if not remainder or all(token.isdigit() and len(token) <= 2 for token in remainder):
+                return prefix
+        return parts
 
     def _order_final_columns(self, frame: pd.DataFrame) -> list[str]:
         preferred = ["name", "entity_name"]
@@ -1042,7 +1019,7 @@ class PredictiveDatasetBuilder:
         return preferred + sorted(columns, key=priority)
 
     def _trim_excess_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
-        max_columns = max(self.minimum_columns, min(36, max(12, len(frame) * 2)))
+        max_columns = max(self.minimum_columns, min(24, max(12, len(frame) * 2)))
         if len(frame.columns) <= max_columns:
             return frame
 
@@ -1077,7 +1054,10 @@ class PredictiveDatasetBuilder:
     def _enforce_fill_rate(self, frame: pd.DataFrame) -> None:
         target_column = self._resolve_quality_column(frame, [self.target_field] if self.target_field else [])
         feature_columns = self._resolve_quality_columns(frame, self.core_feature_fields)
-        if not feature_columns:
+        required_feature_columns = self._resolve_quality_columns(frame, self.required_feature_fields)
+        if required_feature_columns:
+            feature_columns = required_feature_columns
+        elif not feature_columns:
             feature_columns = self._infer_core_feature_columns(frame)
 
         if target_column is not None:
@@ -1161,87 +1141,6 @@ class PredictiveDatasetBuilder:
             missing = missing | normalized.isin({"", "unknown", "n/a", "na", "none", "null"})
         return missing
 
-    def _has_zero_variance(self, series: pd.Series) -> bool:
-        if len(series) == 0:
-            return True
-        non_missing = series.loc[~self._series_missing_mask(series)]
-        if non_missing.empty:
-            return True
-        normalized = non_missing.map(lambda value: str(value).strip().casefold() if isinstance(value, str) else value)
-        return normalized.nunique(dropna=True) <= 1
-
-    def _semantic_prune_columns(self, frame: pd.DataFrame, *, target_column: str) -> list[str]:
-        candidate_columns = [
-            str(column)
-            for column in frame.columns
-            if column != target_column and str(column) not in PROTECTED_METADATA_COLUMNS
-        ]
-        if not candidate_columns:
-            return []
-
-        gateway = self._get_semantic_pruning_gateway()
-        if gateway is None:
-            return []
-
-        system_prompt = (
-            "You are a machine learning feature-pruning assistant. "
-            "Review candidate dataset columns and identify columns that are clearly UI artifacts, random noise, page chrome, rankings-only clutter, or otherwise irrelevant to predicting the target variable. "
-            "Be conservative: keep plausible business, statistical, demographic, operational, or domain features. "
-            "Return JSON only."
-        )
-        user_prompt = (
-            f"Identify any columns in this list that are clearly UI artifacts, random noise, or completely irrelevant to predicting the target variable '{target_column}'. "
-            "Return a JSON list of column names to drop.\n\n"
-            f"Columns:\n{json.dumps(candidate_columns, indent=2)}"
-        )
-        try:
-            response = gateway.complete_text(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_tokens=300,
-            )
-            parsed = self._parse_json_list(response)
-        except LLMError as exc:
-            LOGGER.warning("Semantic pruning skipped because the LLM call failed: %s", exc)
-            return []
-        except ValueError as exc:
-            LOGGER.warning("Semantic pruning skipped because the LLM returned invalid JSON: %s", exc)
-            return []
-
-        seen: set[str] = set()
-        drops: list[str] = []
-        valid_columns = set(candidate_columns)
-        for column in parsed:
-            normalized = str(column).strip()
-            if normalized in valid_columns and normalized not in seen:
-                seen.add(normalized)
-                drops.append(normalized)
-        return drops
-
-    def _get_semantic_pruning_gateway(self) -> LLMGateway | None:
-        if self.llm_gateway is not None:
-            return self.llm_gateway
-        try:
-            self.llm_gateway = LLMGateway(model="gpt-4o-mini", max_tokens=400)
-        except LLMError as primary_exc:
-            LOGGER.warning("Fast semantic pruning model unavailable: %s", primary_exc)
-            try:
-                self.llm_gateway = LLMGateway(max_tokens=400)
-            except LLMError as fallback_exc:
-                LOGGER.warning("Semantic pruning disabled because no LLM gateway is available: %s", fallback_exc)
-                return None
-        return self.llm_gateway
-
-    def _parse_json_list(self, value: str) -> list[str]:
-        cleaned = value.strip()
-        start = cleaned.find("[")
-        end = cleaned.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            cleaned = cleaned[start : end + 1]
-        parsed = json.loads(cleaned)
-        if not isinstance(parsed, list):
-            raise ValueError("Expected a JSON list")
-        return [str(item) for item in parsed if isinstance(item, str)]
 
     def _drop_low_value_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
         keep = ["entity_name"]
@@ -1931,6 +1830,37 @@ class PredictiveDatasetBuilder:
             keep.append(column)
         return frame[keep]
 
+    def _repair_entity_schema_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if "name" not in frame.columns:
+            return frame
+        repaired = frame.copy()
+        name_series = repaired["name"]
+        if not self._series_looks_entity_like(name_series):
+            return repaired
+        for field_name in self._expected_schema_fields():
+            if field_name not in ENTITY_SCHEMA_FIELDS or field_name not in repaired.columns:
+                continue
+            series = repaired[field_name]
+            if self._series_looks_entity_like(series):
+                continue
+            repaired[field_name] = name_series
+        return repaired
+
+    def _series_looks_entity_like(self, series: pd.Series) -> bool:
+        if pd.api.types.is_numeric_dtype(series):
+            return False
+        values = [
+            str(value).strip()
+            for value in series.dropna().tolist()
+            if not self._is_empty_cell(value)
+        ]
+        if not values:
+            return False
+        sample = values[: min(len(values), 25)]
+        alpha_like = sum(1 for value in sample if re.search(r"[A-Za-z]", value))
+        long_numeric = sum(1 for value in sample if re.fullmatch(r"[-+]?\d+(\.\d+)?", value))
+        return alpha_like >= max(1, len(sample) // 2) and long_numeric < alpha_like
+
     def _merge_source_columns(self, left: pd.Series | None, right: pd.Series | None) -> pd.Series:
         if left is None and right is None:
             return pd.Series(dtype="object")
@@ -1994,6 +1924,7 @@ class PredictiveBuildResult:
 
     dataframe: pd.DataFrame
     provenance_map: dict[str, str]
+    pruning_audit: dict[str, Any] = field(default_factory=dict)
 
     @property
     def records(self) -> list[dict[str, Any]]:

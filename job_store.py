@@ -19,11 +19,18 @@ class JobStore:
         self.root = settings.jobs_dir
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def create_job(self, *, goal: str, max_agents: int) -> dict[str, Any]:
+    def create_job(
+        self,
+        *,
+        goal: str,
+        max_agents: int,
+        normalized_goal: str | None = None,
+    ) -> dict[str, Any]:
         job_id = str(uuid4())
         payload = {
             "job_id": job_id,
             "goal": goal,
+            "normalized_goal": normalized_goal or goal,
             "max_agents": max_agents,
             "status": "queued",
             "created_at": _utc_now(),
@@ -74,11 +81,33 @@ class JobStore:
         payload = self.read(job_id)
         payload["status"] = "failed"
         payload["updated_at"] = _utc_now()
+        payload["completed_at"] = _utc_now()
         payload["error"] = error
         payload["progress"] = {
             "stage": "failed",
             "message": error,
             "detail": None,
+        }
+        self._write(job_id, payload)
+
+    def mark_partial_success(
+        self,
+        job_id: str,
+        *,
+        message: str,
+        detail: dict[str, Any] | None = None,
+        artifacts: dict[str, Any] | None = None,
+    ) -> None:
+        payload = self.read(job_id)
+        payload["status"] = "partial_success"
+        payload["updated_at"] = _utc_now()
+        payload["completed_at"] = _utc_now()
+        payload["error"] = message
+        payload["artifacts"] = artifacts or {}
+        payload["progress"] = {
+            "stage": "partial_success",
+            "message": message,
+            "detail": detail,
         }
         self._write(job_id, payload)
 

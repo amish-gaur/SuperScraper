@@ -179,6 +179,12 @@ a {
   font-size: 0.92rem;
 }
 
+.field-hint {
+  margin: -6px 0 16px;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.88rem;
+}
+
 .field input,
 .field textarea {
   width: 100%;
